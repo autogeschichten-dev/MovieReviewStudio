@@ -5,19 +5,32 @@ on:
     tags:
       - 'stage1-windows-v*'
   workflow_dispatch:
+    inputs:
+      release_tag:
+        description: Existing Stage 1 Windows release tag
+        required: true
+        type: string
 
 permissions:
   contents: read
 
 env:
   ZIP_NAME: MovieReviewStudio-Windows-x64.zip
+  RELEASE_TAG: ${{ inputs.release_tag || github.ref_name }}
 
 jobs:
   build:
     runs-on: windows-2022
     timeout-minutes: 45
     steps:
+      - name: Validate release tag
+        shell: bash
+        run: |
+          [[ "$RELEASE_TAG" == stage1-windows-v* ]]
+          git check-ref-format "refs/tags/$RELEASE_TAG"
       - uses: actions/checkout@v4
+        with:
+          ref: refs/tags/${{ env.RELEASE_TAG }}
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
@@ -103,7 +116,6 @@ jobs:
           if-no-files-found: error
 
   publish:
-    if: startsWith(github.ref, 'refs/tags/stage1-windows-v')
     needs: build
     runs-on: ubuntu-latest
     permissions:
@@ -116,7 +128,7 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          gh release create "$GITHUB_REF_NAME" "$ZIP_NAME" \
+          gh release create "$RELEASE_TAG" "$ZIP_NAME" \
             --repo "$GITHUB_REPOSITORY" --verify-tag \
             --title "Movie Review Studio Stage 1 for Windows x64" \
             --notes "Extract the ZIP and double-click RUN_WINDOWS.bat or MovieReviewStudio.exe. Keep the extracted folder together."
