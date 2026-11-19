@@ -2,7 +2,13 @@
 
 Movie Review Studio is a standalone Windows desktop editor for making one 16–18 minute review montage from a local movie. It uses Python, PySide6, FFmpeg, PySceneDetect and OpenCV. It has no dependency on Movie Montage Studio.
 
-## Windows setup
+## Portable Windows x64 package
+
+Download the ZIP from [GitHub Releases](https://github.com/autogeschichten-dev/MovieReviewStudio/releases), extract the entire archive, and double-click `RUN_WINDOWS.bat` or `MovieReviewStudio.exe`. Keep the extracted folder together. The package includes Python, Qt, FFmpeg, and FFprobe.
+
+The **Windows x64 package** GitHub Actions workflow builds the portable ZIP, runs the test suite, and smoke-tests the extracted editor. A push of a `stage1-windows-v*` tag publishes the checked ZIP as a GitHub Release asset.
+
+## Windows setup from source
 
 1. Install 64-bit [Python 3.12](https://www.python.org/downloads/windows/) with the Windows launcher (`py`).
 2. Install a Windows [FFmpeg build](https://ffmpeg.org/download.html#build-windows) with `libx264` and AAC. Add its `bin` directory to PATH, then open a new terminal and check `ffmpeg -version` and `ffprobe -version`.

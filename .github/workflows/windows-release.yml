@@ -1,0 +1,122 @@
+name: Windows x64 package
+
+on:
+  push:
+    tags:
+      - 'stage1-windows-v*'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  ZIP_NAME: MovieReviewStudio-Windows-x64.zip
+
+jobs:
+  build:
+    runs-on: windows-2022
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          architecture: x64
+      - uses: msys2/setup-msys2@v2
+        with:
+          msystem: UCRT64
+          install: >-
+            git make diffutils
+            mingw-w64-ucrt-x86_64-gcc
+            mingw-w64-ucrt-x86_64-nasm
+            mingw-w64-ucrt-x86_64-pkgconf
+
+      - name: Build FFmpeg and FFprobe
+        shell: msys2 {0}
+        run: bash packaging/build-ffmpeg-windows.sh
+
+      - name: Install pinned application and packaging dependencies
+        run: |
+          python -m pip install -r requirements.txt PyInstaller==6.12.0
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          python -m pip check
+
+      - name: Run tests with the bundled media tools
+        run: |
+          $tools = (Resolve-Path build/ffmpeg/bin).Path
+          $env:PATH = "$tools;$env:PATH"
+          foreach ($name in 'ffmpeg.exe', 'ffprobe.exe') {
+            if ((Get-Command $name).Source -ne (Join-Path $tools $name)) {
+              throw "Tests would use a different copy of $name."
+            }
+          }
+          python -m unittest discover -s tests -v
+
+      - name: Build and zip the portable application
+        run: |
+          python -m PyInstaller --noconfirm --onedir --windowed --name MovieReviewStudio `
+            --paths . --add-data "build/ffmpeg/bin:ffmpeg-bin" `
+            --copy-metadata PySide6 --copy-metadata PySide6-Essentials `
+            --copy-metadata PySide6-Addons --copy-metadata shiboken6 `
+            --copy-metadata opencv-python-headless --copy-metadata numpy `
+            --copy-metadata scenedetect --copy-metadata click `
+            --copy-metadata platformdirs --copy-metadata tqdm packaging/windows_entry.py
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          Copy-Item packaging/RUN_WINDOWS.bat, packaging/README-WINDOWS.txt dist/MovieReviewStudio
+          Copy-Item -Recurse build/ffmpeg/source dist/MovieReviewStudio/FFmpeg-Source
+          Compress-Archive -Path dist/MovieReviewStudio -DestinationPath $env:ZIP_NAME
+
+      - name: Smoke test the extracted package without Python or FFmpeg on PATH
+        run: |
+          $smoke = Join-Path $env:RUNNER_TEMP 'Movie Review Studio smoke'
+          Expand-Archive -Path $env:ZIP_NAME -DestinationPath $smoke
+          $app = Join-Path $smoke MovieReviewStudio
+          $marker = Join-Path $smoke ready.txt
+          $env:PATH = "$env:SystemRoot\System32;$env:SystemRoot"
+          $env:QT_QPA_PLATFORM = 'offscreen'
+          foreach ($name in 'python.exe', 'ffmpeg.exe', 'ffprobe.exe') {
+            if (Get-Command $name -ErrorAction SilentlyContinue) {
+              throw "$name is unexpectedly available on PATH."
+            }
+          }
+          if (!(Test-Path (Join-Path $app RUN_WINDOWS.bat))) {
+            throw 'The ZIP is missing RUN_WINDOWS.bat.'
+          }
+          $exe = Join-Path $app MovieReviewStudio.exe
+          $process = Start-Process -FilePath $exe -WorkingDirectory $env:RUNNER_TEMP `
+            -ArgumentList @('--startup-smoke-test', ('"{0}"' -f $marker)) -PassThru
+          if (!$process.WaitForExit(30000)) {
+            Stop-Process -Id $process.Id -Force
+            $log = Join-Path $env:LOCALAPPDATA 'Movie Review Studio\studio.log'
+            if (Test-Path $log) { Get-Content $log -Tail 30 }
+            throw 'The frozen app startup timed out.'
+          }
+          if ($process.ExitCode -ne 0 -or !(Test-Path $marker) -or
+              (Get-Content $marker -Raw).Trim() -ne 'Movie Review Studio ready') {
+            throw "The packaged editor did not open. Exit code $($process.ExitCode)."
+          }
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows-x64
+          path: ${{ env.ZIP_NAME }}
+          if-no-files-found: error
+
+  publish:
+    if: startsWith(github.ref, 'refs/tags/stage1-windows-v')
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: windows-x64
+      - name: Publish verified ZIP
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" "$ZIP_NAME" \
+            --repo "$GITHUB_REPOSITORY" --verify-tag \
+            --title "Movie Review Studio Stage 1 for Windows x64" \
+            --notes "Extract the ZIP and double-click RUN_WINDOWS.bat or MovieReviewStudio.exe. Keep the extracted folder together."

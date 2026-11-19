@@ -21,9 +21,16 @@ class Media:
     sar: Fraction = Fraction(1)
 
 
+def tool_path(name: str) -> str:
+    if getattr(sys, "frozen", False):
+        return str(Path(sys._MEIPASS) / "ffmpeg-bin" / f"{name}.exe")
+    return name
+
+
 def invoke(args: list[str], *, binary: bool = False):
     process = subprocess.run(
-        args, capture_output=True, creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0,
+        [tool_path(args[0]), *args[1:]], capture_output=True,
+        creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0,
     )
     if process.returncode:
         message = process.stderr.decode("utf-8", "replace").strip()

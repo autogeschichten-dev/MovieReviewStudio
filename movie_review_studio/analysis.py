@@ -10,7 +10,7 @@ import cv2
 import numpy as np
 from scenedetect.detectors import ContentDetector
 
-from .media import Media, ffmpeg, frame_clock, identity, invoke, video_seek
+from .media import Media, ffmpeg, frame_clock, identity, invoke, tool_path, video_seek
 from .model import Clip, Signature
 
 WIDTH, HEIGHT = 320, 180
@@ -111,7 +111,7 @@ def analyze(media: Media, cache: Path, progress) -> Analysis:
         fingerprints.clear()
         metrics.clear()
 
-    command = ["ffmpeg", "-nostdin", "-v", "error", "-threads", "2", "-i", str(media.path),
+    command = [tool_path("ffmpeg"), "-nostdin", "-v", "error", "-threads", "2", "-i", str(media.path),
                "-map", "0:v:0", "-an", "-sn", "-filter_threads", "2", "-vf", f"scale={WIDTH}:{HEIGHT}",
                "-fps_mode", "passthrough", "-pix_fmt", "bgr24", "-f", "rawvideo", "-threads", "1", "pipe:1"]
     with tempfile.TemporaryFile() as errors, subprocess.Popen(
