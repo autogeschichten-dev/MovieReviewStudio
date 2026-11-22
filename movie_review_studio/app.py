@@ -5,21 +5,21 @@ import logging
 import math
 import sys
 
-from PySide6.QtCore import QObject, QRunnable, QStandardPaths, QThreadPool, Qt, QUrl, Signal
-from PySide6.QtGui import QColor, QPainter
+from PySide6.QtCore import QObject, QRunnable, QSize, QStandardPaths, QThreadPool, Qt, QUrl, Signal
+from PySide6.QtGui import QColor, QIcon, QPainter
 from PySide6.QtMultimedia import QAudioOutput, QMediaPlayer
 from PySide6.QtMultimediaWidgets import QVideoWidget
 from PySide6.QtWidgets import (
     QApplication, QComboBox, QFileDialog, QFormLayout, QGridLayout, QHBoxLayout,
     QHeaderView, QLabel, QLineEdit, QMainWindow, QMessageBox, QProgressBar,
-    QPushButton, QSlider, QSpinBox, QTabWidget, QTableWidget, QTableWidgetItem,
+    QPushButton, QSlider, QSpinBox, QSplitter, QTabWidget, QTableWidget, QTableWidgetItem,
     QVBoxLayout, QWidget,
 )
 
-from .analysis import analyze, atomic_json, fingerprint_highlight
+from .analysis import analyze, atomic_json, fingerprint_highlight, thumbnail_path
 from .media import identity, inspect, invoke
-from .model import adjacent_conflict, choose, overlaps, replacement, validate
-from .render import render
+from .model import adjacent_conflict, choose, overlaps, replacement, timeline_entries, validate
+from .render import render, render_selection
 
 
 class JobSignals(QObject):
@@ -125,17 +125,24 @@ class Studio(QMainWindow):
         self.voice = self.music = None
         self.highlights = []
         self.clips = []
-        self.playing_clips = []
+        self.montage_playback = False
+        self.entries = []
+        self.active_row = None
+        self.play_offset = 0
+        self.play_entry = None
+        self.pending_play = False
+        self.browser_source = None
         self.job = None
         self.source_playback = False
         self.dragging = False
         self.setWindowTitle("Movie Review Studio")
-        self.resize(1240, 725)
+        self.resize(1280, 800)
         self.setMinimumSize(960, 640)
 
         self.tabs = QTabWidget()
         self.tabs.addTab(self.import_tab(), "Import")
         self.tabs.addTab(self.cut_tab(), "Cut")
+        self.tabs.addTab(self.scenes_tab(), "Scenes")
         self.tabs.addTab(self.final_tab(), "Final")
 
         self.player = QMediaPlayer(self)
@@ -146,6 +153,7 @@ class Studio(QMainWindow):
         self.player.setVideoOutput(video)
         self.player.positionChanged.connect(self.position_changed)
         self.player.durationChanged.connect(lambda duration: self.seek.setMaximum(duration))
+        self.player.mediaStatusChanged.connect(self.start_pending_preview)
         self.player.errorOccurred.connect(self.playback_error)
         self.seek = QSlider(Qt.Orientation.Horizontal)
         self.seek.setRange(0, 0)
@@ -175,7 +183,11 @@ class Studio(QMainWindow):
         workspace.addWidget(self.tabs, 6)
         workspace.addLayout(preview, 5)
         workspace.setSpacing(18)
-        layout.addLayout(workspace, 1)
+        split = QSplitter(Qt.Orientation.Vertical)
+        split.addWidget(self.panel(workspace))
+        split.addWidget(self.timeline_panel())
+        split.setSizes([390, 335])
+        layout.addWidget(split, 1)
         layout.addWidget(self.progress)
         central = QWidget()
         central.setLayout(layout)
@@ -256,27 +268,64 @@ class Studio(QMainWindow):
 
         actions = QHBoxLayout()
         actions.addWidget(self.button("Generate montage", self.generate))
-        actions.addWidget(self.button("Play assembly", lambda: self.preview(self.clips)))
         actions.addWidget(self.button("Save edit…", self.save_project))
         layout.addLayout(actions)
+        layout.addStretch(1)
+        return self.panel(layout)
+
+    @staticmethod
+    def clip_table(headers):
+        table = QTableWidget(0, len(headers))
+        table.setHorizontalHeaderLabels(headers)
+        table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
+        table.verticalHeader().hide()
+        table.verticalHeader().setDefaultSectionSize(51)
+        table.setIconSize(QSize(80, 45))
+        table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
+        table.setSelectionMode(QTableWidget.SelectionMode.SingleSelection)
+        table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+        return table
+
+    def scenes_tab(self):
+        layout = QVBoxLayout()
+        self.scene_search = QLineEdit()
+        self.scene_search.setPlaceholderText("Find by scene number, source time, or status")
+        self.scene_search.textChanged.connect(self.filter_scenes)
+        layout.addWidget(self.scene_search)
+        self.scenes = self.clip_table(["Scene", "Source in", "Source out", "Duration", "Status"])
+        self.scenes.cellDoubleClicked.connect(lambda *_: self.perform(self.preview_candidate))
+        layout.addWidget(self.scenes, 1)
+        actions = QHBoxLayout()
+        actions.addWidget(self.button("Preview scene", self.preview_candidate))
+        actions.addWidget(self.button("Add to montage", self.add_candidate))
+        actions.addWidget(self.button("Replace timeline clip", self.replace_with_candidate))
+        layout.addLayout(actions)
+        return self.panel(layout)
+
+    def timeline_panel(self):
+        layout = QVBoxLayout()
+        self.playhead = QLabel("Montage timeline")
+        self.playhead.setObjectName("previewTitle")
+        layout.addWidget(self.playhead)
         self.timeline = Timeline()
-        self.timeline.seek.connect(lambda fraction: self.player.setPosition(round(fraction * self.player.duration())))
+        self.timeline.seek.connect(self.seek_timeline)
         layout.addWidget(self.timeline)
-        self.table = QTableWidget(0, 5)
-        self.table.setHorizontalHeaderLabels(["#", "Type", "Timeline", "Source in", "Length"])
-        self.table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
-        self.table.verticalHeader().hide()
-        self.table.verticalHeader().setDefaultSectionSize(25)
-        self.table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
-        self.table.setSelectionMode(QTableWidget.SelectionMode.SingleSelection)
-        self.table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+        self.table = self.clip_table(["Clip", "Source in", "Source out", "Montage in", "Montage out",
+                                      "Duration", "Movie audio"])
         self.table.cellDoubleClicked.connect(lambda *_: self.perform(self.play_clip))
         layout.addWidget(self.table, 1)
         edits = QHBoxLayout()
+        edits.addWidget(self.button("Play assembly", lambda: self.preview(self.clips, assembly=True)))
         edits.addWidget(self.button("Play selected", self.play_clip))
-        edits.addWidget(self.button("Replace selected", self.replace_clip))
-        edits.addWidget(self.button("Delete selected", self.delete_clip))
+        self.replace_selected = self.button("Replace selected", self.replace_clip)
+        self.delete_selected = self.button("Delete selected", self.delete_clip)
+        edits.addWidget(self.replace_selected)
+        edits.addWidget(self.delete_selected)
+        edits.addWidget(self.button("Move earlier", lambda: self.move_clip(-1)))
+        edits.addWidget(self.button("Move later", lambda: self.move_clip(1)))
+        edits.addStretch(1)
         layout.addLayout(edits)
+        self.table.currentCellChanged.connect(self.update_edit_controls)
         return self.panel(layout)
 
     def final_tab(self):
@@ -287,7 +336,7 @@ class Studio(QMainWindow):
         self.export_button = self.button("Validate and export MP4…", self.export)
         self.export_button.setObjectName("primary")
         layout.addWidget(self.export_button)
-        layout.addWidget(self.button("Play assembly", lambda: self.preview(self.clips)))
+        layout.addWidget(self.button("Play assembly", lambda: self.preview(self.clips, assembly=True)))
         layout.addStretch(1)
         return self.panel(layout)
 
@@ -419,8 +468,11 @@ class Studio(QMainWindow):
         end = start + round(self.length.value() * self.movie.fps)
         # Quantize inward at 15 seconds and outward at 10 seconds.
         end = start + max(math.ceil(10 * self.movie.fps), min(int(15 * self.movie.fps), end - start))
+        self.read_highlight_range(index, start, end)
+
+    def read_highlight_range(self, index, start, end):
         self.background("Reading highlight frames…",
-                        lambda _: fingerprint_highlight(self.movie, self.analysis, start, end),
+                        lambda _: fingerprint_highlight(self.movie, self.analysis, start, end, cache=self.cache),
                         lambda clip: self.apply_highlight(index, clip))
 
     def apply_highlight(self, index, clip):
@@ -482,26 +534,71 @@ class Studio(QMainWindow):
 
     def selected_row(self):
         index = self.table.currentRow()
-        if not 0 <= index < len(self.clips):
+        if not 0 <= index < len(self.entries):
             raise ValueError("Select a timeline clip.")
         return index
 
     def play_clip(self):
-        self.preview([self.clips[self.selected_row()]])
+        self.require_movie(True)
+        row = self.selected_row()
+        entry = self.entries[row]
+        self.background("Preparing selected clip…", lambda progress: render_selection(
+            self.movie, self.analysis, self.clips, row, self.voice, self.music, self.cache, progress),
+            lambda path: self.load_player(path, f"Selected clip {row + 1}", montage=True, entry=entry))
+
+    def select_edit(self, index):
+        row = next((row for row, entry in enumerate(self.entries) if entry.edit_index == index), None)
+        if row is not None:
+            self.table.selectRow(row)
+
+    def update_edit_controls(self, *_):
+        row = self.table.currentRow()
+        entry = self.entries[row] if 0 <= row < len(self.entries) else None
+        original = entry is not None and entry.segment.highlight
+        self.replace_selected.setText("Replace highlight" if original else "Replace selected")
+        self.delete_selected.setText("Trim highlight segment" if original else "Delete selected")
 
     def replace_clip(self):
-        index = self.selected_row()
-        if self.clips[index].highlight:
-            self.read_highlight(self.highlights.index(self.clips[index]))
+        index = self.entries[self.selected_row()].edit_index
+        clip = self.clips[index]
+        if clip.highlight:
+            self.highlight_list.setCurrentIndex(self.highlights.index(clip))
+            self.start_time.setText(clock(clip.start / self.movie.fps))
+            self.length.setValue(round(clip.frames / self.movie.fps))
+            self.tabs.setCurrentIndex(1)
+            self.start_time.setFocus()
+            self.statusBar().showMessage("Set a continuous source range, then click Replace in Cut.")
             return
         edits = self.clips.copy()
         edits[index] = replacement(edits, index, self.analysis.candidates)
         self.check(edits)
         self.set_clips(edits)
-        self.table.selectRow(index)
+        self.select_edit(index)
 
     def delete_clip(self):
-        self.remove_edit(self.clips[self.selected_row()])
+        entry = self.entries[self.selected_row()]
+        clip = self.clips[entry.edit_index]
+        if not clip.highlight:
+            self.remove_edit(clip)
+            return
+        segment = entry.segment
+        if segment.start != clip.start and segment.end != clip.end:
+            raise ValueError("Trim a highlight from either end to keep the dialogue continuous.")
+        start = segment.end if segment.start == clip.start else clip.start
+        end = segment.start if segment.end == clip.end else clip.end
+        if (end - start) / self.movie.fps < 10:
+            raise ValueError("A highlight must keep at least 10 seconds. Use Cut to remove the entire highlight.")
+        self.read_highlight_range(self.highlights.index(clip), start, end)
+
+    def move_clip(self, delta):
+        index = self.entries[self.selected_row()].edit_index
+        destination = index + delta
+        if 0 <= destination < len(self.clips):
+            edits = self.clips.copy()
+            edits[index], edits[destination] = edits[destination], edits[index]
+            self.check(edits)
+            self.set_clips(edits)
+            self.select_edit(destination)
 
     def remove_edit(self, clip):
         edits = [item for item in self.clips if item != clip]
@@ -514,35 +611,82 @@ class Studio(QMainWindow):
         self.require_movie()
         self.load_player(self.movie.path, "Source movie", source=True)
 
-    def preview(self, clips):
+    def selected_candidate(self):
+        self.require_movie(True)
+        row = self.scenes.currentRow()
+        if row < 0 or self.scenes.isRowHidden(row):
+            raise ValueError("Select a source scene.")
+        return self.analysis.candidates[row]
+
+    def preview_candidate(self):
+        self.preview([self.selected_candidate()])
+
+    def add_candidate(self):
+        edits = [*self.clips, self.selected_candidate()]
+        self.check(edits)
+        self.set_clips(edits)
+        self.select_edit(len(edits) - 1)
+
+    def replace_with_candidate(self):
+        candidate = self.selected_candidate()
+        index = self.entries[self.selected_row()].edit_index
+        if self.clips[index].highlight:
+            raise ValueError("Replace original-audio highlights with a continuous source range in Cut.")
+        edits = self.clips.copy()
+        edits[index] = candidate
+        self.check(edits)
+        self.set_clips(edits)
+        self.select_edit(index)
+
+    def preview(self, clips, *, assembly=False):
         self.require_movie(True)
         self.check(clips)
-        assembled = clips == self.clips and len(clips) > 1
-        voice = self.voice if assembled else None
-        music = self.music if assembled else None
+        voice = self.voice if assembly else None
+        music = self.music if assembly else None
+        label = "Montage preview" if assembly else "Source range preview"
         self.background("Preparing preview…", lambda progress: render(self.movie, self.analysis, clips, voice,
                         music, self.cache, progress), lambda path: self.load_player(
-                        path, "Montage preview" if assembled else "Selected clip", clips=clips))
+                        path, label, montage=assembly))
 
-    def load_player(self, path, label, *, source=False, clips=()):
+    def load_player(self, path, label, *, source=False, montage=False, entry=None):
+        self.montage_playback = False
+        self.pending_play = False
         self.player.stop()
         self.source_playback = source
-        self.playing_clips = list(clips)
-        self.timeline.set_frame(0 if len(self.playing_clips) > 1 and self.playing_clips == self.clips else None)
+        self.montage_playback = montage
+        self.play_entry = entry
+        self.play_offset = entry.position if entry else 0
+        self.set_active_clip(None)
+        self.timeline.set_frame(self.play_offset if montage else None)
+        self.position_changed(0)
         self.preview_label.setText(label)
         url = QUrl.fromLocalFile(str(path))
+        self.pending_play = True
         if self.player.source() == url:
-            self.player.setPosition(0)
+            self.start_pending_preview(self.player.mediaStatus())
         else:
             self.player.setSource(url)
+
+    def start_pending_preview(self, status):
+        if not self.pending_play or status not in (
+            QMediaPlayer.MediaStatus.LoadedMedia, QMediaPlayer.MediaStatus.BufferedMedia,
+            QMediaPlayer.MediaStatus.EndOfMedia,
+        ):
+            return
+        self.pending_play = False
+        self.player.setPosition(0)
         self.player.play()
 
     def invalidate_preview(self):
         if not self.source_playback:
+            self.pending_play = False
+            self.play_entry = None
+            self.play_offset = 0
+            self.montage_playback = False
             self.player.stop()
             self.player.setSource(QUrl())
-            self.playing_clips = []
             self.timeline.set_frame(None)
+            self.set_active_clip(None)
             self.preview_label.setText("Preview")
 
     def toggle_playback(self):
@@ -552,6 +696,10 @@ class Studio(QMainWindow):
             self.player.pause()
         else:
             self.player.play()
+
+    def seek_timeline(self, fraction):
+        frame = fraction * self.timeline.total - self.play_offset
+        self.player.setPosition(max(0, min(round(frame * 1000 / self.movie.fps), self.player.duration())))
 
     def seek_released(self):
         self.dragging = False
@@ -565,16 +713,70 @@ class Studio(QMainWindow):
         if not self.dragging:
             self.seek.setValue(position)
         self.position.setText(clock(position / 1000))
-        if len(self.playing_clips) > 1 and self.playing_clips == self.clips:
-            frame = position * self.movie.fps / 1000
+        if self.montage_playback:
+            # Allow half a millisecond for Qt's rounded presentation timestamps.
+            end = self.play_offset + self.play_entry.segment.frames if self.play_entry else self.timeline.total
+            frame = self.play_offset + int((position * self.movie.fps + self.movie.fps / 2) / 1000)
+            frame = min(frame, end - 1)
             self.timeline.set_frame(frame)
-            cursor = 0
-            for index, clip in enumerate(self.playing_clips):
-                cursor += clip.frames
-                if frame < cursor:
-                    if self.table.currentRow() != index:
-                        self.table.selectRow(index)
+            for row, entry in enumerate(self.entries):
+                if entry.position <= frame < entry.position + entry.segment.frames:
+                    self.set_active_clip(row)
+                    montage_time = self.play_offset / self.movie.fps + position / 1000
+                    self.playhead.setText(f"Montage timeline  ·  {clock(montage_time)}  ·  Clip {row + 1}")
                     break
+
+    def set_active_clip(self, row):
+        if row == self.active_row:
+            return
+        if self.active_row is not None and (previous := self.table.item(self.active_row, 0)):
+            previous.setBackground(QColor("#1b222c"))
+        self.active_row = row
+        if row is None:
+            self.playhead.setText("Montage timeline")
+        elif item := self.table.item(row, 0):
+            item.setBackground(QColor("#305c59"))
+
+    def thumbnail_item(self, number, clip):
+        item = QTableWidgetItem(str(number))
+        item.setIcon(QIcon(str(thumbnail_path(self.cache, self.source_key, clip.start))))
+        return item
+
+    def duration_item(self, clip):
+        duration = clip.frames / self.movie.fps
+        item = QTableWidgetItem(f"{float(duration):.3f} s")
+        item.setToolTip(f"{clip.frames} frames · {duration} seconds exactly")
+        return item
+
+    def refresh_scenes(self):
+        candidates = self.analysis.candidates if self.analysis else []
+        if self.browser_source is not self.analysis:
+            self.browser_source = self.analysis
+            self.scenes.clearContents()
+            self.scenes.setRowCount(len(candidates))
+            for row, clip in enumerate(candidates):
+                self.scenes.setItem(row, 0, self.thumbnail_item(row + 1, clip))
+                self.scenes.setItem(row, 1, QTableWidgetItem(clock(clip.start / self.movie.fps)))
+                self.scenes.setItem(row, 2, QTableWidgetItem(clock(clip.end / self.movie.fps)))
+                self.scenes.setItem(row, 3, self.duration_item(clip))
+        used = {(clip.start, clip.end) for clip in self.clips if not clip.highlight}
+        for row, clip in enumerate(candidates):
+            if any(overlaps(clip, highlight) for highlight in self.highlights):
+                status, color = "Highlight", "#f6c976"
+            elif (clip.start, clip.end) in used:
+                status, color = "Selected", "#81ecd9"
+            else:
+                status, color = "Unused", "#b6c1cf"
+            item = QTableWidgetItem(status)
+            item.setForeground(QColor(color))
+            self.scenes.setItem(row, 4, item)
+        self.filter_scenes()
+
+    def filter_scenes(self, *_):
+        terms = self.scene_search.text().casefold().split()
+        for row in range(self.scenes.rowCount()):
+            text = " ".join(self.scenes.item(row, column).text() for column in (0, 1, 2, 3, 4)).casefold()
+            self.scenes.setRowHidden(row, not all(term in text for term in terms))
 
     def refresh(self):
         movie = self.movie
@@ -591,20 +793,31 @@ class Studio(QMainWindow):
                                      for number, clip in enumerate(self.highlights, 1)])
         if self.highlights:
             self.highlight_list.setCurrentIndex(max(0, min(index, len(self.highlights) - 1)))
-        if self.timeline.clips != self.clips:
-            self.timeline.set_clips(self.clips)
-        self.table.setRowCount(len(self.clips))
-        cursor = 0
-        for index, clip in enumerate(self.clips):
-            data = [str(index + 1), "Original audio" if clip.highlight else "Regular", clock(cursor / movie.fps),
-                    clock(clip.start / movie.fps), f"{float(clip.frames / movie.fps):.2f} s"]
-            for column, text in enumerate(data):
-                item = QTableWidgetItem(text)
+        entries = timeline_entries(self.clips, movie.fps) if movie else []
+        if entries != self.entries or self.browser_source is not self.analysis:
+            self.entries = entries
+            self.timeline.set_clips([entry.segment for entry in entries])
+            self.table.setRowCount(len(entries))
+            for row, entry in enumerate(entries):
+                clip = entry.segment
+                first = self.thumbnail_item(row + 1, clip)
                 if clip.highlight:
-                    item.setForeground(Qt.GlobalColor.yellow)
-                self.table.setItem(index, column, item)
-            cursor += clip.frames
-        self.final_summary.setText(f"{len(self.clips)} clips · {clock(cursor / movie.fps if movie else 0)}\n"
+                    group = self.highlights.index(self.clips[entry.edit_index]) + 1
+                    first.setText(f"{row + 1}  ·  H{group}")
+                    first.setToolTip(f"Segment of highlight {group}. This highlight moves as one continuous range.")
+                audio = QTableWidgetItem("ORIGINAL" if clip.highlight else "MUTED")
+                audio.setForeground(QColor("#f6c976" if clip.highlight else "#81ecd9"))
+                cells = (
+                    first, QTableWidgetItem(clock(clip.start / movie.fps)), QTableWidgetItem(clock(clip.end / movie.fps)),
+                    QTableWidgetItem(clock(entry.position / movie.fps)),
+                    QTableWidgetItem(clock((entry.position + clip.frames) / movie.fps)), self.duration_item(clip), audio,
+                )
+                for column, item in enumerate(cells):
+                    self.table.setItem(row, column, item)
+            self.update_edit_controls()
+        self.refresh_scenes()
+        cursor = sum(clip.frames for clip in self.clips)
+        self.final_summary.setText(f"{len(entries)} video segments · {clock(cursor / movie.fps if movie else 0)}\n"
                                    f"{sum(clip.highlight for clip in self.clips)} original-audio highlights in timeline\n"
                                    "H.264 video · AAC stereo · MP4")
         self.export_button.setEnabled(bool(self.clips))
@@ -618,10 +831,10 @@ class Studio(QMainWindow):
         if destination.resolve() in {item.resolve() for item in (self.movie.path, self.voice, self.music) if item}:
             raise ValueError("Save the edit to a different file from the imported media.")
         atomic_json(destination, {
-            "version": 1, "movie": str(self.movie.path), "source_key": self.source_key,
+            "version": 2, "movie": str(self.movie.path), "source_key": self.source_key,
             "voice": str(self.voice) if self.voice else None, "music": str(self.music) if self.music else None,
             "title": self.title.text(), "year": self.year.value(), "target": self.target.value(),
-            "highlights": [[c.start, c.end] for c in self.highlights],
+            "highlights": [[c.start, c.end, list(c.cuts)] for c in self.highlights],
             "clips": [[c.start, c.end, c.highlight] for c in self.clips],
         })
         self.statusBar().showMessage(f"Saved edit to {destination}")
@@ -637,15 +850,22 @@ class Studio(QMainWindow):
 
         def load(progress):
             payload = json.loads(Path(path).read_text(encoding="utf-8"))
-            if payload["version"] != 1:
+            if payload["version"] not in (1, 2):
                 raise ValueError("Unsupported edit file version.")
             movie = inspect(Path(payload["movie"]))
             if identity(movie.path) != payload["source_key"]:
                 raise ValueError("The saved edit references a different or changed movie file.")
             analysis = analyze(movie, self.cache, progress)
-            highlights = [fingerprint_highlight(movie, analysis, start, end) for start, end in payload["highlights"]]
+            highlights = [
+                fingerprint_highlight(movie, analysis, *item[:2], cache=self.cache,
+                                      cuts=tuple(item[2]) if payload["version"] == 2 else None)
+                for item in payload["highlights"]
+            ]
             indexed = {(c.start, c.end, c.highlight): c for c in analysis.candidates + highlights}
-            clips = [indexed[tuple(item)] for item in payload["clips"]]
+            try:
+                clips = [indexed[tuple(item)] for item in payload["clips"]]
+            except KeyError as error:
+                raise ValueError("A saved clip is missing from the source analysis.") from error
             if clips:
                 validate(clips, movie.fps, analysis.frames, has_audio=movie.has_audio)
             ordered = sorted(highlights, key=lambda clip: clip.start)

@@ -11,11 +11,11 @@ import numpy as np
 from scenedetect.detectors import ContentDetector
 
 from .media import Media, ffmpeg, frame_clock, identity, invoke, tool_path, video_seek
-from .model import Clip, Signature
+from .model import Clip, MAX_CLIP_SECONDS, Signature, highlight_cuts, video_segments
 
 WIDTH, HEIGHT = 320, 180
 FRAME_BYTES = WIDTH * HEIGHT * 3
-VERSION = "analysis-4"
+VERSION = "analysis-5"
 
 
 @dataclass(frozen=True)
@@ -23,6 +23,20 @@ class Analysis:
     frames: int
     offset: float
     candidates: list[Clip]
+    shot_starts: tuple[int, ...] = ()
+
+
+def thumbnail_path(cache: Path, source_key: str, frame: int) -> Path:
+    return cache / f"{VERSION}-{source_key}-thumbs" / f"{frame}.jpg"
+
+
+def save_thumbnail(cache: Path, source_key: str, index: int, frame: np.ndarray):
+    path = thumbnail_path(cache, source_key, index)
+    path.parent.mkdir(exist_ok=True)
+    image = cv2.resize(frame, (128, 72), interpolation=cv2.INTER_AREA)
+    encoded, data = cv2.imencode(".jpg", image)
+    if encoded:
+        path.write_bytes(data.tobytes())
 
 
 def signature(frame: np.ndarray) -> Signature:
@@ -83,7 +97,8 @@ def analyze(media: Media, cache: Path, progress) -> Analysis:
             payload = json.loads(result_path.read_text(encoding="utf-8"))
             progress("Loaded cached shot analysis.")
             return Analysis(payload["frames"], payload["offset"],
-                            [clip_from_dict(item) for item in payload["candidates"]])
+                            [clip_from_dict(item) for item in payload["candidates"]],
+                            tuple(payload["shot_starts"]))
         except (ValueError, KeyError, TypeError):
             progress("Rebuilding an unreadable analysis cache.")
     progress("Checking source frame timestamps…")
@@ -94,20 +109,23 @@ def analyze(media: Media, cache: Path, progress) -> Analysis:
     offset = origin - format_start
     cv2.setNumThreads(2)
     detector = ContentDetector(threshold=25, min_scene_len=1)
-    limit = int(5 * media.fps)
+    limit = int(MAX_CLIP_SECONDS * media.fps)
     minimum = max(1, round(float(media.fps) * .40))
     candidates = []
     fingerprints = []
     metrics = []
     previous = None
+    first_frame = None
     start = 0
     shot = 0
+    shot_starts = []
 
     def finish():
         if len(fingerprints) >= minimum and metrics:
             quality, unusable, credits = np.mean(metrics, axis=0)
             if unusable < .32 and credits < (.45 if start > .85 * count else .70):
                 candidates.append(make_clip(start, fingerprints, float(quality), shot))
+                save_thumbnail(cache, key, start, first_frame)
         fingerprints.clear()
         metrics.clear()
 
@@ -131,9 +149,11 @@ def analyze(media: Media, cache: Path, progress) -> Analysis:
                     previous = None
                 if cuts:
                     shot += 1
+                    shot_starts.append(index)
                 if not black:
                     if not fingerprints:
                         start = index
+                        first_frame = frame
                     fingerprints.append(signature(frame))
                     if (index - start) % 4 == 0:
                         previous, quality, _, unusable, credits = measure(frame, previous)
@@ -152,17 +172,25 @@ def analyze(media: Media, cache: Path, progress) -> Analysis:
         raise ValueError(f"The decoder returned {index} frames, but the source clock lists {count}.")
     if identity(media.path) != key:
         raise ValueError("The source changed during analysis. Import it again.")
-    atomic_json(result_path, {"frames": count, "offset": offset, "candidates": [asdict(c) for c in candidates]})
-    return Analysis(count, offset, candidates)
+    atomic_json(result_path, {"frames": count, "offset": offset, "candidates": [asdict(c) for c in candidates],
+                              "shot_starts": shot_starts})
+    return Analysis(count, offset, candidates, tuple(shot_starts))
 
 
-def fingerprint_highlight(media: Media, analysis: Analysis, start: int, end: int) -> Clip:
+def fingerprint_highlight(media: Media, analysis: Analysis, start: int, end: int, *,
+                          cache: Path | None = None, cuts: tuple[int, ...] | None = None) -> Clip:
     if not media.has_audio or not 0 <= start < end <= analysis.frames or not 10 <= (end - start) / media.fps <= 15:
         raise ValueError("A highlight needs movie audio and a 10–15 second range inside the movie.")
     media = replace(media, offset=analysis.offset)
+    cuts = highlight_cuts(start, end, media.fps, analysis.shot_starts) if cuts is None else cuts
+    clip = Clip(start, end, 0, (), (), (), True, cuts=cuts)
+    parts = video_segments(clip, media.fps)
+    if not cuts or any(not 0 < part.frames / media.fps <= MAX_CLIP_SECONDS for part in parts):
+        raise ValueError("Saved highlight segments must be contiguous and at most 5 seconds each.")
     length = end - start
     middle = np.linspace(0, length - 1, 5, dtype=int)
-    indices = sorted(set(range(3)) | set(range(length - 3, length)) | set(middle))
+    thumbnails = {part.start - start for part in parts} if cache else set()
+    indices = sorted(set(range(3)) | set(range(length - 3, length)) | set(middle) | thumbnails)
     select = "+".join(f"eq(n\\,{index})" for index in indices)
     data = ffmpeg(*video_seek(media, start), "-map", "0:v:0", "-an",
                   "-vf", f"select={select},scale={WIDTH}:{HEIGHT}",
@@ -172,6 +200,11 @@ def fingerprint_highlight(media: Media, analysis: Analysis, start: int, end: int
         raise RuntimeError("The decoder could not read the full highlight range.")
     frames = np.frombuffer(data, dtype=np.uint8).reshape((-1, HEIGHT, WIDTH, 3))
     fingerprints = {index: signature(frame) for index, frame in zip(indices, frames)}
-    return Clip(start, end, 0, tuple(fingerprints[i] for i in range(3)),
-                tuple(fingerprints[i] for i in range(length - 3, length)),
-                tuple(fingerprints[i] for i in middle), True)
+    if cache:
+        key = identity(media.path)
+        for index, frame in zip(indices, frames):
+            if index in thumbnails:
+                save_thumbnail(cache, key, start + index, frame)
+    return replace(clip, first=tuple(fingerprints[i] for i in range(3)),
+                   last=tuple(fingerprints[i] for i in range(length - 3, length)),
+                   samples=tuple(fingerprints[i] for i in middle))

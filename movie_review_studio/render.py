@@ -10,10 +10,10 @@ import wave
 
 from .analysis import Analysis
 from .media import Media, ffmpeg, identity, invoke, seconds, video_seek
-from .model import Clip, validate
+from .model import Clip, MAX_CLIP_SECONDS, timeline_entries, validate
 
 RATE = 48000
-VERSION = "render-3"
+VERSION = "render-4"
 
 
 def dimensions(movie: Media, preview: bool) -> tuple[int, int]:
@@ -25,12 +25,15 @@ def dimensions(movie: Media, preview: bool) -> tuple[int, int]:
 
 
 def render_clip(movie: Media, clip: Clip, destination: Path, preview: bool):
+    if not 0 < clip.frames / movie.fps <= MAX_CLIP_SECONDS:
+        raise ValueError("Each video segment must be at most 5 seconds.")
     width, height = dimensions(movie, preview)
     ffmpeg(*video_seek(movie, clip.start), "-map", "0:v:0", "-an", "-sn", "-dn",
            "-vf", f"scale={width}:{height}:flags=lanczos,setsar=1,setpts=N*{movie.fps.denominator}/{movie.fps.numerator}/TB",
            "-frames:v", str(clip.frames), "-r", str(movie.fps), "-fps_mode", "cfr",
            "-c:v", "libx264", "-threads", "3", "-preset", "ultrafast" if preview else "fast",
-           "-crf", "25" if preview else "17", "-pix_fmt", "yuv420p", str(destination))
+           "-crf", "25" if preview else "17", "-pix_fmt", "yuv420p",
+           "-video_track_timescale", str(movie.fps.numerator), str(destination))
     frames = invoke(["ffprobe", "-v", "error", "-select_streams", "v:0", "-show_entries",
                      "stream=nb_frames", "-of", "csv=p=0", str(destination)]).strip()
     if frames != str(clip.frames):
@@ -77,8 +80,11 @@ def audio_track(movie: Media, clips: list[Clip], voice: Path | None, music: Path
             if highlight:
                 clip = next(originals)
                 timestamp = max(0, movie.offset + float(clip.start / movie.fps))
+                fade = min(round(.012 * RATE), count // 2)
+                edges = f"afade=t=in:ss=0:ns={fade},afade=t=out:ss={count - fade}:ns={fade}"
+                # Decode dialogue once across all the group's video cuts.
                 ffmpeg("-ss", seconds(timestamp), "-i", str(movie.path), "-map", "0:a:0", "-vn",
-                       "-af", f"aresample={RATE}:async=1:first_pts=0,{limit}",
+                       "-af", f"aresample={RATE}:async=1:first_pts=0,{limit},{edges}",
                        "-ac", "2", "-ar", str(RATE), str(target))
             else:
                 args = []
@@ -112,12 +118,41 @@ def audio_track(movie: Media, clips: list[Clip], voice: Path | None, music: Path
     return output
 
 
+def preview_chunk(cache: Path, source_key: str, clip: Clip) -> Path:
+    return cache / f"{VERSION}-{source_key}-{clip.start}-{clip.end}.mp4"
+
+
+def render_selection(movie: Media, analysis: Analysis, clips: list[Clip], row: int,
+                     voice: Path | None, music: Path | None, cache: Path, progress) -> Path:
+    entry = timeline_entries(clips, movie.fps)[row]
+    assembly = render(movie, analysis, clips, voice, music, cache, progress)
+    destination = cache / f"{assembly.stem}-clip-{row + 1}.mp4"
+    if destination.is_file():
+        return destination
+    start = round(entry.position * RATE / movie.fps)
+    end = round((entry.position + entry.segment.frames) * RATE / movie.fps)
+    with tempfile.TemporaryDirectory(prefix=".mrs-", dir=cache) as temporary:
+        folder = Path(temporary)
+        video = preview_chunk(cache, identity(movie.path), entry.segment)
+        if not video.is_file():
+            video = folder / "video.mp4"
+            render_clip(replace(movie, offset=analysis.offset), entry.segment, video, True)
+        result = folder / "selected.mp4"
+        progress("Preparing the selected clip with its montage audio…")
+        ffmpeg("-i", str(video), "-i", str(assembly), "-map", "0:v:0", "-map", "1:a:0",
+               "-c:v", "copy", "-af", f"atrim=start_sample={start}:end_sample={end},asetpts=PTS-STARTPTS",
+               "-c:a", "aac", "-b:a", "256k", "-movflags", "+faststart", str(result))
+        result.replace(destination)
+    return destination
+
+
 def render(movie: Media, analysis: Analysis, clips: list[Clip], voice: Path | None,
            music: Path | None, cache: Path, progress, *, destination: Path | None = None) -> Path:
     preview = destination is None
     validate(clips, movie.fps, analysis.frames, final=not preview, has_audio=movie.has_audio)
+    entries = timeline_entries(clips, movie.fps)
     identities = [identity(path) if path else None for path in (movie.path, voice, music)]
-    key_data = (VERSION, identities, [(c.start, c.end, c.highlight) for c in clips])
+    key_data = (VERSION, identities, [(c.start, c.end, c.highlight, c.cuts) for c in clips])
     key = hashlib.sha256(json.dumps(key_data).encode()).hexdigest()
     destination = destination or cache / f"preview-{key}.mp4"
     if destination.resolve() in {path.resolve() for path in (movie.path, voice, music) if path}:
@@ -128,12 +163,13 @@ def render(movie: Media, analysis: Analysis, clips: list[Clip], voice: Path | No
     with tempfile.TemporaryDirectory(prefix=".mrs-", dir=destination.parent) as temporary:
         folder = Path(temporary)
         listing = []
-        for index, clip in enumerate(clips, 1):
-            progress(f"Rendering video clip {index} of {len(clips)}…")
+        previous_us = 0
+        for index, entry in enumerate(entries, 1):
+            clip = entry.segment
+            progress(f"Rendering video clip {index} of {len(entries)}…")
             name = f"clip-{index:04}.mp4"
             part = folder / name
-            chunk_key = f"{VERSION}-{identities[0]}-{clip.start}-{clip.end}.mp4"
-            cached = cache / chunk_key
+            cached = preview_chunk(cache, identities[0], clip)
             if preview and cached.is_file():
                 shutil.copyfile(cached, part)
             else:
@@ -142,7 +178,9 @@ def render(movie: Media, analysis: Analysis, clips: list[Clip], voice: Path | No
                     pending = folder / "chunk.mp4"
                     shutil.copyfile(part, pending)
                     pending.replace(cached)
-            listing.extend((f"file '{name}'", f"duration {seconds(clip.frames / movie.fps)}"))
+            end_us = round((entry.position + clip.frames) * 1_000_000 / movie.fps)
+            listing.extend((f"file '{name}'", f"duration {seconds(Fraction(end_us - previous_us, 1_000_000))}"))
+            previous_us = end_us
         concat = folder / "clips.ffconcat"
         concat.write_text("\n".join(listing) + "\n", encoding="ascii")
         progress("Mixing narration, music and original-audio highlights…")
@@ -150,7 +188,7 @@ def render(movie: Media, analysis: Analysis, clips: list[Clip], voice: Path | No
         intermediate = folder / "result.mp4"
         ffmpeg("-f", "concat", "-safe", "1", "-i", str(concat), "-i", str(audio),
                "-map", "0:v:0", "-map", "1:a:0", "-c:v", "copy", "-c:a", "aac", "-b:a", "256k",
-               "-movflags", "+faststart", str(intermediate))
+               "-video_track_timescale", str(movie.fps.numerator), "-movflags", "+faststart", str(intermediate))
         if identities != [identity(path) if path else None for path in (movie.path, voice, music)]:
             raise ValueError("An imported file changed during rendering. Import the media again.")
         intermediate.replace(destination)

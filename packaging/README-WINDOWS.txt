@@ -1,4 +1,4 @@
-Movie Review Studio Stage 1 for Windows x64
+Movie Review Studio for Windows x64
 
 Extract the entire ZIP, then double-click RUN_WINDOWS.bat or
 MovieReviewStudio.exe. Keep the _internal folder next to the executable.

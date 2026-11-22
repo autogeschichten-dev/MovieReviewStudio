@@ -2,7 +2,7 @@ from dataclasses import replace
 from fractions import Fraction
 import unittest
 
-from movie_review_studio.model import Clip, Signature, adjacent_conflict, choose, replacement, validate
+from movie_review_studio.model import Clip, Signature, adjacent_conflict, choose, replacement, timeline_entries, validate
 
 
 def clip(start, length=5, image=None, highlight=False):
@@ -52,6 +52,16 @@ class MontageTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "16–18"):
             validate([clip(0, 10, image=10, highlight=True), clip(20, 10, image=150, highlight=True)],
                      Fraction(1), 100, final=True)
+
+    def test_fractional_rate_highlight_never_rounds_past_five_seconds(self):
+        fps = Fraction(24000, 1001)
+        highlight = clip(17, 240, highlight=True)
+        entries = timeline_entries([highlight], fps)
+        self.assertEqual([(entry.segment.start, entry.segment.end) for entry in entries],
+                         [(17, 97), (97, 177), (177, 257)])
+        self.assertTrue(all(entry.segment.frames / fps <= 5 for entry in entries))
+        with self.assertRaisesRegex(ValueError, "invalid segment"):
+            validate([replace(highlight, cuts=(137,))], fps, 300)
 
     def test_generation_creates_one_valid_full_timeline(self):
         candidates = [clip(index * 6, image=index * 101 % 256) for index in range(300)]

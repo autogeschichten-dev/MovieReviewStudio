@@ -4,10 +4,11 @@ on:
   push:
     tags:
       - 'stage1-windows-v*'
+      - 'stage2-windows-v*'
   workflow_dispatch:
     inputs:
       release_tag:
-        description: Existing Stage 1 Windows release tag
+        description: Existing Windows release tag
         required: true
         type: string
 
@@ -26,7 +27,7 @@ jobs:
       - name: Validate release tag
         shell: bash
         run: |
-          [[ "$RELEASE_TAG" == stage1-windows-v* ]]
+          [[ "$RELEASE_TAG" == stage1-windows-v* || "$RELEASE_TAG" == stage2-windows-v* ]]
           git check-ref-format "refs/tags/$RELEASE_TAG"
       - uses: actions/checkout@v4
         with:
@@ -35,6 +36,17 @@ jobs:
         with:
           python-version: '3.12'
           architecture: x64
+
+      - name: Smoke test the dependency-installing Windows launcher
+        if: startsWith(env.RELEASE_TAG, 'stage2-')
+        timeout-minutes: 10
+        run: |
+          $marker = Join-Path $env:RUNNER_TEMP 'source launch ready.txt'
+          powershell.exe -NoProfile -ExecutionPolicy Bypass -File packaging/launch-windows.ps1 -SmokeMarker $marker
+          if ($LASTEXITCODE -ne 0 -or !(Test-Path $marker)) {
+            throw 'The source launcher failed to install dependencies and open the editor.'
+          }
+
       - uses: msys2/setup-msys2@v2
         with:
           msystem: UCRT64
@@ -75,7 +87,13 @@ jobs:
             --copy-metadata scenedetect --copy-metadata click `
             --copy-metadata platformdirs --copy-metadata tqdm packaging/windows_entry.py
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          Copy-Item packaging/RUN_WINDOWS.bat, packaging/README-WINDOWS.txt dist/MovieReviewStudio
+          git archive --format=zip -o build/project-source.zip HEAD
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          Expand-Archive -Path build/project-source.zip -DestinationPath dist/MovieReviewStudio
+          if (!(Test-Path dist/MovieReviewStudio/RUN_WINDOWS.bat)) {
+            Copy-Item packaging/RUN_WINDOWS.bat dist/MovieReviewStudio
+          }
+          Copy-Item packaging/README-WINDOWS.txt dist/MovieReviewStudio
           Copy-Item -Recurse build/ffmpeg/source dist/MovieReviewStudio/FFmpeg-Source
           Compress-Archive -Path dist/MovieReviewStudio -DestinationPath $env:ZIP_NAME
 
@@ -130,5 +148,5 @@ jobs:
         run: |
           gh release create "$RELEASE_TAG" "$ZIP_NAME" \
             --repo "$GITHUB_REPOSITORY" --verify-tag \
-            --title "Movie Review Studio Stage 1 for Windows x64" \
+            --title "Movie Review Studio for Windows x64 ($RELEASE_TAG)" \
             --notes "Extract the ZIP and double-click RUN_WINDOWS.bat or MovieReviewStudio.exe. Keep the extracted folder together."

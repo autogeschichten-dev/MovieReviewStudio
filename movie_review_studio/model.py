@@ -1,10 +1,12 @@
 """Frame-indexed edit decisions and montage validation."""
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from fractions import Fraction
 from math import ceil
 from typing import Protocol
 
 import numpy as np
+
+MAX_CLIP_SECONDS = 5
 
 
 @dataclass(frozen=True)
@@ -23,10 +25,53 @@ class Clip:
     samples: tuple[Signature, ...]
     highlight: bool = False
     shot: int | None = None
+    cuts: tuple[int, ...] = ()  # Internal video boundaries of a continuous highlight.
 
     @property
     def frames(self):
         return self.end - self.start
+
+
+def highlight_cuts(start: int, end: int, fps: Fraction, shot_starts=()) -> tuple[int, ...]:
+    """Split a continuous source range at shot cuts and balance any long pieces."""
+    maximum = int(MAX_CLIP_SECONDS * fps)
+    boundaries = [start]
+    for frame in sorted(set(shot_starts)):
+        if boundaries[-1] + 2 <= frame <= end - 2:
+            boundaries.append(frame)
+    boundaries.append(end)
+    cuts = []
+    for left, right in zip(boundaries, boundaries[1:]):
+        length = right - left
+        pieces = ceil(Fraction(length, maximum))
+        cuts.extend(left + length * piece // pieces for piece in range(1, pieces))
+        cuts.append(right)
+    return tuple(cuts[:-1])
+
+
+def video_segments(clip: Clip, fps: Fraction) -> tuple[Clip, ...]:
+    if not clip.highlight:
+        return (clip,)
+    cuts = clip.cuts or highlight_cuts(clip.start, clip.end, fps)
+    bounds = (clip.start, *cuts, clip.end)
+    return tuple(replace(clip, start=start, end=end, cuts=()) for start, end in zip(bounds, bounds[1:]))
+
+
+@dataclass(frozen=True)
+class TimelineEntry:
+    edit_index: int
+    segment: Clip
+    position: int
+
+
+def timeline_entries(clips: list[Clip], fps: Fraction) -> list[TimelineEntry]:
+    entries = []
+    cursor = 0
+    for index, clip in enumerate(clips):
+        for segment in video_segments(clip, fps):
+            entries.append(TimelineEntry(index, segment, cursor))
+            cursor += segment.frames
+    return entries
 
 
 class HighlightRecommender(Protocol):
@@ -74,7 +119,9 @@ def validate(clips: list[Clip], fps: Fraction, source_frames: int, *,
             highlights += 1
             if not has_audio or not 10 <= duration <= 15:
                 raise ValueError(f"Highlight {number} needs movie audio and a length of 10–15 seconds.")
-        elif duration > 5:
+            if any(not 0 < part.frames / fps <= MAX_CLIP_SECONDS for part in video_segments(clip, fps)):
+                raise ValueError(f"Highlight {number} has an invalid segment. Each segment must be at most 5 seconds.")
+        elif duration > MAX_CLIP_SECONDS:
             raise ValueError(f"Regular clip {number} exceeds 5 seconds.")
         if index and adjacent_conflict(clips[index - 1], clip):
             raise ValueError(f"Clips {index} and {number} look too similar at this cut.")
