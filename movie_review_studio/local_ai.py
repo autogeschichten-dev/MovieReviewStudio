@@ -166,7 +166,7 @@ class VisionBatch:
         self.source_key = identity(movie.path)
         self.loaded = False
 
-    def describe(self, clips, progress, observe=None):
+    def describe(self, clips, progress, observe=None, *, cache_only=False):
         result = {}
         failure = ""
         provider_failures = 0
@@ -184,6 +184,9 @@ class VisionBatch:
             progress(f"Visual AI analysis · {index}/{self.total} · source {source_time:.2f}s")
             if saved.exists():
                 description = json.loads(saved.read_text(encoding="utf-8"))
+            elif cache_only:
+                self.failed += 1
+                continue
             else:
                 description = None
                 attempted_provider = False
@@ -231,6 +234,10 @@ class VisionBatch:
                          "successful": len(result), "failed": self.failed, "elapsed": elapsed, "eta": remaining})
             if provider_failures >= 4 and not result:
                 break
+        if cache_only:
+            progress(f"Cache reuse · {len(result)}/{self.total} visual observations · no inference")
+            if not result:
+                raise ObservationError("No compatible cached observations. Use Resume AI Review to analyze missing scenes.")
         if not result:
             raise ObservationError(f"No visual evidence after {self.failed} skipped or failed scenes. "
                                    f"Last issue: {failure or 'no usable source frames'}. "

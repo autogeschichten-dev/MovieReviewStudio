@@ -76,12 +76,16 @@ def test_text(model):
         return "Select a separate text model."
     response = None
     try:
-        response = local_ai.request("/v1/chat/completions", {
-            "model": model, "stream": False, "response_format": {"type": "json_object"},
-            "messages": [{"role": "user", "content": 'What is two plus two? Return JSON with an integer answer field.'}],
+        response = local_ai.request("/api/chat", {
+            "model": model, "stream": False,
+            "format": {"type": "object", "required": ["answer", "shot"], "properties": {
+                "answer": {"type": "integer"}, "shot": {"type": "string", "enum": ["s0"]}}},
+            "options": {"num_ctx": 2048, "num_predict": 32, "temperature": 0},
+            "messages": [{"role": "user", "content": "Return JSON. What is two plus two? The only allowed shot ID is s0."}],
         }, timeout=60)
-        message = response["choices"][0]["message"]["content"]
-        passed = json.loads(message).get("answer") == 4
+        message = response["message"]["content"]
+        passed = json.loads(message) == {"answer": 4, "shot": "s0"}
+        passed = passed and response.get("done_reason") != "length"
         return ("Text test passed" if passed else "Text replied, but the answer check failed") + f" · {message[:250]}"
     except (RuntimeError, IndexError, KeyError, TypeError, ValueError) as error:
         return f"Text test failed · {error} · {str(response)[:250]}"
@@ -110,7 +114,7 @@ def peak(samples):
 def diagnostic(destination, video=None):
     destination = Path(destination)
     started = monotonic()
-    log = ["Movie Review Studio V3.1.1 local AI diagnostic",
+    log = ["Movie Review Studio V3.1.2 local AI diagnostic",
            "Measurements are made on this computer. No movie or frame is sent outside loopback."]
     stop = Event()
     ram, gpu = [ram_used()], [gpu_used()]
@@ -181,7 +185,14 @@ def diagnostic(destination, video=None):
                     log.append(f"Transcription speed: {movie.duration / max(.001, elapsed):.2f}x source real time.")
             else:
                 log.append("Transcription not measured. Supply an authorized video with audio and configure faster-whisper.")
-        ok = True
+        text_model = os.getenv("MRS_DIAG_TEXT_MODEL", "qwen2.5:3b")
+        if text_model in models:
+            text_result = test_text(text_model)
+            log.append(f"Qwen text JSON / candidate-ID check · {text_model} · {text_result}")
+            ok = text_result.startswith("Text test passed")
+        else:
+            log.append(f"Text endpoint check skipped · {text_model} is not installed.")
+            ok = True
     except Exception as error:
         log.append(f"ERROR: {type(error).__name__}: {error}")
     finally:

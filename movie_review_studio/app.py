@@ -11,7 +11,7 @@ import math
 import sys
 
 from PySide6.QtCore import QObject, QRunnable, QSize, QStandardPaths, QThreadPool, QTimer, Qt, QUrl, Signal
-from PySide6.QtGui import QKeySequence, QPixmap, QShortcut, QValidator
+from PySide6.QtGui import QDesktopServices, QKeySequence, QPixmap, QShortcut, QValidator
 from PySide6.QtMultimedia import QAudioOutput, QMediaPlayer
 from PySide6.QtMultimediaWidgets import QVideoWidget
 from PySide6.QtWidgets import (
@@ -131,6 +131,8 @@ class Studio(QMainWindow):
         self.pending_position = 0
         self.browser_preview_token = None
         self.job = None
+        self.planning_resume = None
+        self.planning_report = None
         self.source_playback = False
         self.dragging = False
         self.setWindowTitle("Movie Review Studio")
@@ -213,6 +215,16 @@ class Studio(QMainWindow):
         self.vision_panel = self.panel(observation)
         self.vision_panel.hide()
         layout.addWidget(self.vision_panel)
+        recovery = QHBoxLayout()
+        self.recovery_status = QLabel()
+        self.recovery_status.setWordWrap(True)
+        recovery.addWidget(self.recovery_status, 1)
+        recovery.addWidget(self.button("Retry failed chapter", lambda: self.retry_ai(True)))
+        recovery.addWidget(self.button("Resume AI Review", lambda: self.retry_ai(False)))
+        recovery.addWidget(self.button("Open diagnostic report", self.open_ai_report))
+        self.recovery_panel = self.panel(recovery)
+        self.recovery_panel.hide()
+        layout.addWidget(self.recovery_panel)
         self.setCentralWidget(self.panel(layout))
         for shortcut, action in ((QKeySequence.StandardKey.Undo, self.undo), (QKeySequence.StandardKey.Redo, self.redo)):
             QShortcut(QKeySequence(shortcut), self, activated=lambda fn=action: self.perform(fn))
@@ -394,6 +406,16 @@ class Studio(QMainWindow):
             f"{row['description']}")
         self.vision_panel.show()
 
+    def open_ai_report(self):
+        if self.planning_report and self.planning_report.is_file():
+            QDesktopServices.openUrl(QUrl.fromLocalFile(str(self.planning_report)))
+
+    def retry_ai(self, cache_only):
+        self.require_movie()
+        if not self.planning_resume:
+            raise ValueError("Choose a movie and open AI Director first.")
+        self.planning_resume(cache_only)
+
     def open_director(self):
         from PySide6.QtWidgets import QCheckBox, QDialog, QDialogButtonBox
         self.require_movie()
@@ -462,6 +484,16 @@ class Studio(QMainWindow):
         box = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
         box.button(QDialogButtonBox.StandardButton.Ok).setText("Generate AI Review")
         analyze_only = box.addButton("Analyze Movie", QDialogButtonBox.ButtonRole.ActionRole)
+        cached_only = box.addButton("Retry Planning Only", QDialogButtonBox.ButtonRole.ActionRole)
+        resume = box.addButton("Resume AI Review", QDialogButtonBox.ButtonRole.ActionRole)
+
+        def select_action(choice):
+            nonlocal action
+            action = choice
+            dialog.accept()
+
+        cached_only.clicked.connect(lambda: select_action("cached"))
+        resume.clicked.connect(lambda: select_action("resume"))
         def start_analysis():
             nonlocal action
             action = "analyze"
@@ -472,7 +504,7 @@ class Studio(QMainWindow):
         form.addRow(box)
         if dialog.exec() != QDialog.DialogCode.Accepted:
             return
-        provider = director.VisionProvider.from_environment(reasoning.currentText(), text_only=True) if action == "generate" else None
+        provider = director.VisionProvider.from_environment(reasoning.currentText(), text_only=True) if action != "analyze" else None
         visual_model, speech_model = visual.currentText(), whisper.currentText()
         AISettingsDialog.store("vision", visual_model)
         AISettingsDialog.store("text", reasoning.currentText())
@@ -487,7 +519,10 @@ class Studio(QMainWindow):
         target = self.target.value()
         include_highlights = highlights_enabled.isChecked()
 
-        def work(progress):
+        source_key = self.source_key
+        report_path = self.cache / f"ai-planning-{source_key}.txt"
+        self.planning_report = report_path
+        def work(progress, only_cached):
             progress("Scene detection · checking movie analysis")
             analysis = self.analysis or analyze(self.movie, self.cache, progress)
             _, models = local_ai.discover()
@@ -507,7 +542,7 @@ class Studio(QMainWindow):
             vision = local_ai.VisionBatch(self.movie, analysis, self.cache, visual_model, models[visual_model])
             def observations(clips, report):
                 try:
-                    result = vision.describe(clips, report, observe=report)
+                    result = vision.describe(clips, report, observe=report, cache_only=only_cached)
                 except Exception:
                     try:
                         vision.unload()
@@ -524,7 +559,7 @@ class Studio(QMainWindow):
             try:
                 clips, script = director.plan(self.movie, analysis, highlights, provider, content_mode, lang,
                                               target, text, self.cache, progress, observations=observations,
-                                              transcript=cues)
+                                              transcript=cues, report=report_path)
             except Exception:
                 if local_planner:
                     try:
@@ -554,7 +589,25 @@ class Studio(QMainWindow):
             self.refresh()
             self.statusBar().showMessage(f"AI draft ready · {failed} skipped or failed scenes · review evidence and script.")
 
-        self.background("Preparing local analysis…" if action == "analyze" else "Preparing grounded AI review…", work, apply)
+        def failed(message):
+            from .planning import record
+            record(report_path, failure=message)
+            self.recovery_status.setText(message)
+            self.recovery_panel.show()
+            self.analysis_label.setText("Planning paused · completed evidence remains cached")
+            self.statusBar().showMessage("AI planning paused. Retry or inspect the diagnostic report.")
+
+        def launch(cache_only):
+            if self.source_key != source_key:
+                raise ValueError("This review belongs to a different movie.")
+            self.recovery_panel.hide()
+            self.background("Retrying planning from cached evidence…" if cache_only else "Preparing grounded AI review…",
+                            lambda progress: work(progress, cache_only), apply,
+                            on_error=failed if action != "analyze" else None)
+
+        if action != "analyze":
+            self.planning_resume = launch
+        launch(action == "cached")
 
     def refresh_script(self, selected=None):
         current = self.script_picker.currentIndex()
@@ -837,7 +890,7 @@ class Studio(QMainWindow):
         logging.error("%s", message)
         QMessageBox.warning(self, "Movie Review Studio", message)
 
-    def background(self, message, operation, on_result):
+    def background(self, message, operation, on_result, *, on_error=None):
         self.tabs.setEnabled(False)
         self.progress.show()
         self.cancel_button.show()
@@ -892,7 +945,9 @@ class Studio(QMainWindow):
         def failure(message):
             finish()
             if message:
-                self.error(message)
+                (on_error or self.error)(message)
+            elif on_error:
+                on_error("Planning paused by the user. Completed stages remain cached.")
             else:
                 self.statusBar().showMessage("Operation cancelled")
 
@@ -929,6 +984,9 @@ class Studio(QMainWindow):
 
     def apply_movie(self, result):
         self.movie, self.source_key = result
+        self.recovery_panel.hide()
+        self.planning_resume = None
+        self.planning_report = None
         self.analysis = None
         self.highlights = []
         self.clips = []

@@ -229,7 +229,7 @@ def sample_group(group):
 
 
 def plan(movie, analysis, highlights, provider, mode, language, target, custom, cache, progress,
-         *, observations=None, transcript=None):
+         *, observations=None, transcript=None, report=None):
     progress("Probing source with Video Recap Skills…")
     metadata = probe.probe_sources([movie.path])
     if not metadata["sources"][0].get("has_video"):
@@ -256,7 +256,14 @@ def plan(movie, analysis, highlights, provider, mode, language, target, custom, 
     if mode == "Custom Script" and len(groups) < len(custom_parts):
         raise ValueError("The source has too few distinct chapters for this script.")
     if callable(observations):
-        observations = observations([clip for group in groups for clip in sample_group(group)], progress)
+        # Match the standalone V3.1.1 Analyze Movie sampling and unchanged observation keys.
+        visual = [c for c in analysis.candidates if not c.production_card]
+        observations = observations([c for group in chapters(visual, 16) for c in sample_group(group)], progress)
+    if observations is not None:
+        from .planning import plan as plan_grounded
+        return plan_grounded(movie, analysis, highlights, provider, mode, language, target, custom, cache,
+                             progress, candidates, observations, transcript,
+                             custom_parts if mode == "Custom Script" else [], report)
     all_clips = sorted(highlights, key=lambda c: c.start)
     frame_dir = cache / f"recap-frames-{identity(movie.path)}"
     frame_dir.mkdir(exist_ok=True)
