@@ -5,6 +5,7 @@ on:
     tags:
       - 'stage1-windows-v*'
       - 'stage2-windows-v*'
+      - 'stage3-windows-v*'
   workflow_dispatch:
     inputs:
       release_tag:
@@ -27,7 +28,7 @@ jobs:
       - name: Validate release tag
         shell: bash
         run: |
-          [[ "$RELEASE_TAG" == stage1-windows-v* || "$RELEASE_TAG" == stage2-windows-v* ]]
+          [[ "$RELEASE_TAG" == stage1-windows-v* || "$RELEASE_TAG" == stage2-windows-v* || "$RELEASE_TAG" == stage3-windows-v* ]]
           git check-ref-format "refs/tags/$RELEASE_TAG"
       - uses: actions/checkout@v4
         with:
@@ -38,7 +39,7 @@ jobs:
           architecture: x64
 
       - name: Smoke test the dependency-installing Windows launcher
-        if: startsWith(env.RELEASE_TAG, 'stage2-')
+        if: startsWith(env.RELEASE_TAG, 'stage2-') || startsWith(env.RELEASE_TAG, 'stage3-')
         timeout-minutes: 10
         run: |
           $marker = Join-Path $env:RUNNER_TEMP 'source launch ready.txt'
@@ -48,6 +49,7 @@ jobs:
           }
 
       - uses: msys2/setup-msys2@v2
+        if: ${{ !startsWith(env.RELEASE_TAG, 'stage3-') }}
         with:
           msystem: UCRT64
           install: >-
@@ -57,8 +59,24 @@ jobs:
             mingw-w64-ucrt-x86_64-pkgconf
 
       - name: Build FFmpeg and FFprobe
+        if: ${{ !startsWith(env.RELEASE_TAG, 'stage3-') }}
         shell: msys2 {0}
         run: bash packaging/build-ffmpeg-windows.sh
+
+      - name: Reuse verified Windows media binaries and corresponding source
+        if: startsWith(env.RELEASE_TAG, 'stage3-')
+        run: |
+          $archive = Join-Path $env:RUNNER_TEMP 'verified-media-tools.zip'
+          $extract = Join-Path $env:RUNNER_TEMP 'verified-media-tools'
+          curl.exe -fL --retry 3 -o $archive https://github.com/autogeschichten-dev/MovieReviewStudio/releases/download/stage2-windows-v2.1.0/MovieReviewStudio-Windows-x64.zip
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          if ((Get-FileHash $archive -Algorithm SHA256).Hash -ne 'c46f6cdc7a86e336dfe9bdb00addfd909216fc4a1f030a74dd6e7d07ef9954e2') {
+            throw 'The prior release archive did not match its verified checksum.'
+          }
+          Expand-Archive -Path $archive -DestinationPath $extract
+          New-Item -ItemType Directory -Path build/ffmpeg -Force | Out-Null
+          Copy-Item -Recurse (Join-Path $extract 'MovieReviewStudio/_internal/ffmpeg-bin') build/ffmpeg/bin
+          Copy-Item -Recurse (Join-Path $extract 'MovieReviewStudio/FFmpeg-Source') build/ffmpeg/source
 
       - name: Install pinned application and packaging dependencies
         run: |

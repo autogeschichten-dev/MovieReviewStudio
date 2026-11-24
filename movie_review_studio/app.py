@@ -15,12 +15,13 @@ from PySide6.QtMultimediaWidgets import QVideoWidget
 from PySide6.QtWidgets import (
     QApplication, QComboBox, QFileDialog, QFormLayout, QGridLayout, QHBoxLayout,
     QLabel, QLineEdit, QListView, QMainWindow, QMessageBox, QProgressBar, QScrollArea,
-    QPushButton, QSlider, QSpinBox, QSplitter, QStackedWidget, QTabWidget,
+    QPushButton, QSlider, QSpinBox, QSplitter, QStackedWidget, QTabWidget, QPlainTextEdit,
     QVBoxLayout, QWidget,
 )
 
 from .analysis import analyze, atomic_json, fingerprint_highlight
 from .media import Cancelled, cancellation, identity, inspect, invoke
+from . import director
 from .editor import SceneModel, Timeline, TrackLabels, thumbnail
 from .model import adjacent_conflict, overlaps, replacement, timeline_entries, validate
 from .render import Mix, render, render_selection
@@ -113,6 +114,11 @@ class Studio(QMainWindow):
         self.browser_source = None
         self.mix = Mix()
         self.waves = dict.fromkeys(('original', 'voice', 'music'), AudioEvidence())
+        self.script = []
+        self.script_approved = False
+        self.director_language = "English"
+        self.director_mode = director.MODES[0]
+        self.generated_voice = None
         self.undo_stack = []
         self.redo_stack = []
         self.pending_position = 0
@@ -280,9 +286,10 @@ class Studio(QMainWindow):
         self.target.valueChanged.connect(self.import_target.setValue)
         self.import_target.valueChanged.connect(self.target.setValue)
         header.addWidget(self.target)
-        generate = self.button("Auto Generate Movie Review", self.generate)
+        generate = self.button("Fast Montage", self.generate)
         generate.setObjectName("primary")
         header.addWidget(generate)
+        header.addWidget(self.button("AI Director…", self.open_director))
         header.addWidget(self.button("Save project", self.save_project))
         self.smart_page.addLayout(header)
         self.editor_status = QLabel()
@@ -291,6 +298,7 @@ class Studio(QMainWindow):
         self.smart_page.addWidget(self.editor_status)
 
         top = QSplitter(Qt.Orientation.Horizontal)
+        self.editor_split = top
         top.addWidget(self.panel(preview))
         self.inspector = self.inspector_panel()
         self.inspector.setMinimumWidth(225)
@@ -298,6 +306,9 @@ class Studio(QMainWindow):
         self.advanced = self.scenes_tab()
         self.advanced.setMinimumWidth(275)
         top.addWidget(self.advanced)
+        self.script_panel = self.build_script_panel()
+        top.addWidget(self.script_panel)
+        self.script_panel.hide()
         self.advanced.hide()
         top.setStretchFactor(0, 1)
         top.setSizes([760, 245, 300])
@@ -306,6 +317,263 @@ class Studio(QMainWindow):
         split.addWidget(self.timeline_panel())
         split.setSizes([370, 235])
         self.smart_page.addWidget(split, 1)
+
+    def show_script_panel(self, visible):
+        self.script_panel.setVisible(visible)
+        if visible:
+            sizes = self.editor_split.sizes()
+            sizes[3] = 340
+            sizes[0] = max(400, sizes[0] - 270)
+            self.editor_split.setSizes(sizes)
+
+    def build_script_panel(self):
+        layout = QVBoxLayout()
+        self.script_picker = QComboBox()
+        self.script_picker.activated.connect(self.seek_script)
+        layout.addWidget(self.script_picker)
+        self.script_text = QPlainTextEdit()
+        self.script_text.setPlaceholderText("Select a narration section")
+        layout.addWidget(self.script_text, 1)
+        self.script_evidence = QLabel()
+        self.script_evidence.setWordWrap(True)
+        layout.addWidget(self.script_evidence)
+        actions = QHBoxLayout()
+        actions.addWidget(self.button("Apply text", self.apply_script_text))
+        actions.addWidget(self.button("Approve", self.approve_script))
+        actions.addWidget(self.button("Make voice", self.make_script_voice))
+        actions.addWidget(self.button("Link clip", self.link_script_clip))
+        layout.addLayout(actions)
+        layout.addWidget(self.button("Export timeline JSON…", self.export_director_timeline))
+        layout.addWidget(self.button("Import timeline JSON…", self.import_director_timeline))
+        layout.addWidget(self.button("Align imported narration…", self.align_script_voice))
+        panel = self.panel(layout)
+        panel.setMinimumWidth(255)
+        return panel
+
+    def open_director(self):
+        from PySide6.QtWidgets import QCheckBox, QDialog, QDialogButtonBox
+        self.require_movie()
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Generate AI Review")
+        dialog.resize(520, 420)
+        form = QFormLayout(dialog)
+        mode = QComboBox()
+        mode.addItems(director.MODES)
+        mode.setCurrentText(self.director_mode)
+        form.addRow("Content mode", mode)
+        language = QComboBox()
+        language.addItems(list(director.LANGUAGES))
+        language.setCurrentText(self.director_language)
+        form.addRow("Narration language", language)
+        highlights_enabled = QCheckBox("Include suggested original-audio highlights")
+        highlights_enabled.setChecked(True)
+        form.addRow(highlights_enabled)
+        code = QPlainTextEdit()
+        code.setPlaceholderText("Paste original commentary for Custom Script")
+        form.addRow(code)
+
+        def load_text():
+            name, _ = QFileDialog.getOpenFileName(dialog, "Import a script", "", "Text (*.txt)")
+            if name:
+                try:
+                    code.setPlainText(Path(name).read_text(encoding="utf-8-sig"))
+                    mode.setCurrentText("Custom Script")
+                except (OSError, UnicodeError) as error:
+                    self.error(str(error))
+
+        form.addRow(self.button("Import TXT…", load_text))
+        disclosure = QLabel("Fast Montage runs offline. AI Director uses a configured vision endpoint. "
+                            "Cloud mode sends sampled stills, local transcript excerpts and any custom script. "
+                            "Provider charges may apply. Cost is unavailable unless supplied by your provider.")
+        disclosure.setWordWrap(True)
+        form.addRow(disclosure)
+        box = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
+        box.button(QDialogButtonBox.StandardButton.Ok).setText("Generate AI Review")
+        box.accepted.connect(dialog.accept)
+        box.rejected.connect(dialog.reject)
+        form.addRow(box)
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+        provider = director.VisionProvider.from_environment()
+        if provider.cloud:
+            consent = QMessageBox.question(self, "Allow cloud processing?",
+                f"Send selected movie stills, transcript excerpts and script text to {provider.url}? "
+                "Your provider may charge for this request.")
+            if consent != QMessageBox.StandardButton.Yes:
+                return
+        content_mode, lang, text = mode.currentText(), language.currentText(), code.toPlainText()
+        target = self.target.value()
+        include_highlights = highlights_enabled.isChecked()
+
+        def work(progress):
+            analysis = self.analysis or analyze(self.movie, self.cache, progress)
+            audio = self.read_movie_evidence(progress)
+            highlights = (self.highlights or suggest_highlights(self.movie, analysis, audio, self.cache, progress)
+                          ) if include_highlights else []
+            clips, script = director.plan(self.movie, analysis, highlights, provider, content_mode, lang,
+                                          target, text, self.cache, progress)
+            return analysis, audio, highlights, clips, script
+
+        def apply(result):
+            self.record_edit()
+            self.drop_generated_voice()
+            self.analysis, self.waves["original"], self.highlights, self.clips, self.script = result
+            self.director_mode, self.director_language = content_mode, lang
+            self.script_approved = False
+            self.source_playback = False
+            self.invalidate_preview()
+            self.tabs.setCurrentIndex(1)
+            self.show_script_panel(True)
+            self.refresh()
+            self.statusBar().showMessage("AI draft ready for source and script review.")
+
+        self.background("Preparing grounded AI review…", work, apply)
+
+    def refresh_script(self, selected=None):
+        current = self.script_picker.currentIndex()
+        self.script_picker.clear()
+        linked = director.placements(self.script, self.clips, self.movie.fps) if self.movie else {}
+        for section in self.script:
+            ranges = linked.get(section.id, [])
+            where = clock(ranges[0]["montage_in"]) if ranges else "Unassigned"
+            self.script_picker.addItem(f"{section.id} · {where}", section.id)
+        if self.script:
+            index = selected if selected is not None else min(max(0, current), len(self.script) - 1)
+            self.script_picker.setCurrentIndex(index)
+            section = self.script[index]
+            self.script_text.setPlainText(section.text)
+            ranges = linked.get(section.id, [])
+            details = (f"{len(ranges)} linked segments · " +
+                       (f"{section.duration:.2f} s recorded" if section.duration is not None else "No measured narration"))
+            if ranges:
+                first = ranges[0]
+                details += f"\nSource {clock(first['source_in'])} – {clock(first['source_out'])}"
+                if section.evidence:
+                    details += "\n" + section.evidence[0][2][:175]
+            self.script_evidence.setText(details)
+        else:
+            self.script_text.clear()
+            self.script_evidence.clear()
+
+    def seek_script(self, index):
+        self.refresh_script(index)
+        section = self.script[index]
+        linked = director.placements([section], self.clips, self.movie.fps)[section.id]
+        if linked and self.timeline.total:
+            self.seek_timeline(linked[0]["montage_in"] * float(self.movie.fps) / self.timeline.total)
+
+    def apply_script_text(self):
+        index = self.script_picker.currentIndex()
+        text = self.script_text.toPlainText().strip()
+        if index < 0 or not text:
+            raise ValueError("Select a section and enter its narration text.")
+        if text != self.script[index].text:
+            self.record_edit()
+            self.script[index] = replace(self.script[index], text=text, duration=None)
+            self.script_approved = False
+            self.drop_generated_voice()
+            self.invalidate_preview()
+            self.refresh_script(index)
+
+    def link_script_clip(self):
+        from PySide6.QtWidgets import QInputDialog
+        index = self.script_picker.currentIndex()
+        if index < 0:
+            raise ValueError("Select a script section first.")
+        clip = self.entries[self.selected_row()].segment
+        if clip.movie_audio or clip.highlight:
+            raise ValueError("Select muted narration footage to link to the script.")
+        observation, accepted = QInputDialog.getText(self, "Link source evidence",
+                                                      "What visible or spoken evidence supports this section?")
+        observation = observation.strip()
+        if not accepted or not observation:
+            return
+        self.record_edit()
+        for position, section in enumerate(self.script):
+            evidence = tuple(item for item in section.evidence if item[:2] != (clip.start, clip.end))
+            if position == index:
+                evidence += ((clip.start, clip.end, observation[:1200]),)
+            if evidence != section.evidence:
+                self.script[position] = replace(section, evidence=evidence, duration=None)
+        self.script_approved = False
+        self.drop_generated_voice()
+        self.invalidate_preview()
+        self.refresh_script(index)
+
+    def approve_script(self):
+        if not self.script:
+            raise ValueError("Generate a script first.")
+        self.apply_script_text()
+        self.record_edit()
+        self.script_approved = True
+        self.statusBar().showMessage("Script approved.")
+
+    def drop_generated_voice(self):
+        if self.generated_voice and self.voice == self.generated_voice:
+            self.voice = None
+            self.waves["voice"] = AudioEvidence()
+        self.generated_voice = None
+
+    def make_script_voice(self):
+        if not self.script or not self.script_approved or self.script_text.toPlainText().strip() != self.script[self.script_picker.currentIndex()].text:
+            raise ValueError("Apply text changes and approve the script before generating narration.")
+
+        def work(progress):
+            audio, script = director.synthesize(self.script, self.clips, self.movie,
+                                                self.director_language, self.cache, progress)
+            return audio, script, audio_evidence(audio, self.cache, progress)
+
+        def apply(result):
+            self.record_edit()
+            self.voice, self.script, self.waves["voice"] = result
+            self.generated_voice = self.voice
+            self.invalidate_preview()
+            self.refresh()
+
+        self.background("Generating narration with configured offline TTS…", work, apply)
+
+    def align_script_voice(self):
+        if not self.voice or not self.script or not self.script_approved:
+            raise ValueError("Import narration and approve the script before transcript alignment.")
+        if self.generated_voice == self.voice:
+            raise ValueError("Select the original imported recording before aligning again.")
+
+        def work(progress):
+            audio, script = director.align_recording(self.voice, self.script, self.clips, self.movie,
+                                                      self.director_language, self.cache, progress)
+            return audio, script, audio_evidence(audio, self.cache, progress)
+
+        def apply(result):
+            self.record_edit()
+            self.voice, self.script, self.waves["voice"] = result
+            self.generated_voice = self.voice
+            self.invalidate_preview()
+            self.refresh()
+
+        self.background("Aligning local narration transcript…", work, apply)
+
+    def export_director_timeline(self):
+        self.require_movie(True)
+        self.check(self.clips)
+        path, _ = QFileDialog.getSaveFileName(self, "Export timeline", "timeline.json", "JSON (*.json)")
+        if not path:
+            return
+        if Path(path).resolve() in {item.resolve() for item in (self.movie.path, self.voice, self.music) if item}:
+            raise ValueError("Save timeline JSON to a different file from the imported media.")
+        atomic_json(Path(path), director.timeline_document(self.movie, self.clips, self.script))
+
+    def import_director_timeline(self):
+        self.require_movie(True)
+        path, _ = QFileDialog.getOpenFileName(self, "Import timeline", "", "JSON (*.json)")
+        if path:
+            payload = json.loads(Path(path).read_text(encoding="utf-8"))
+            clips = director.import_timeline(payload, self.movie, self.analysis, self.cache)
+            self.record_edit()
+            self.script = []
+            self.script_approved = False
+            self.highlights = [clip for clip in clips if clip.highlight]
+            self.drop_generated_voice()
+            self.set_clips(clips, record=False)
 
     def inspector_panel(self):
         layout = QVBoxLayout()
@@ -392,7 +660,8 @@ class Studio(QMainWindow):
         for label, action in (("Undo", self.undo), ("Redo", self.redo), ("−", lambda: self.zoom(1 / 1.65)),
                               ("+", lambda: self.zoom(1.65)), ("Fit", lambda: self.zoom(None)),
                               ("Inspector", lambda: self.inspector.setVisible(self.inspector.isHidden())),
-                              ("Scenes", lambda: self.advanced.setVisible(self.advanced.isHidden()))):
+                              ("Scenes", lambda: self.advanced.setVisible(self.advanced.isHidden())),
+                              ("Script", lambda: self.show_script_panel(self.script_panel.isHidden()))):
             toolbar.addWidget(self.button(label, action))
         layout.addLayout(toolbar)
         self.timeline = Timeline(self)
@@ -420,6 +689,7 @@ class Studio(QMainWindow):
         self.export_button = self.button("Validate and export MP4…", self.export)
         self.export_button.setObjectName("primary")
         layout.addWidget(self.export_button)
+        layout.addWidget(self.button("Check exported video…", self.check_recap_export))
         layout.addWidget(self.button("Play assembly", lambda: self.preview(self.clips, assembly=True)))
         layout.addStretch(1)
         return self.panel(layout)
@@ -504,6 +774,9 @@ class Studio(QMainWindow):
         self.highlights = []
         self.clips = []
         self.waves["original"] = AudioEvidence()
+        self.script = []
+        self.script_approved = False
+        self.drop_generated_voice()
         self.undo_stack.clear()
         self.redo_stack.clear()
         if not self.title.text():
@@ -617,6 +890,9 @@ class Studio(QMainWindow):
         if edits:
             self.check(edits)
         self.record_edit()
+        if edits != self.clips:
+            self.script_approved = False
+            self.drop_generated_voice()
         self.highlights, self.clips = updated, edits
         self.invalidate_preview()
         self.refresh()
@@ -672,6 +948,9 @@ class Studio(QMainWindow):
 
         def apply(result):
             self.record_edit()
+            self.script = []
+            self.script_approved = False
+            self.drop_generated_voice()
             self.analysis, self.waves["original"], self.highlights, self.clips = result
             self.source_playback = False
             self.invalidate_preview()
@@ -682,7 +961,8 @@ class Studio(QMainWindow):
         self.background("Analyzing and generating the review…", build, apply)
 
     def snapshot(self):
-        return (self.clips[:], self.highlights[:], self.mix, self.voice, self.music, self.waves.copy())
+        return (self.clips[:], self.highlights[:], self.mix, self.voice, self.music, self.waves.copy(),
+                self.script[:], self.script_approved, self.director_language, self.director_mode, self.generated_voice)
 
     def record_edit(self):
         self.undo_stack.append(self.snapshot())
@@ -691,7 +971,8 @@ class Studio(QMainWindow):
     def restore_edit(self, source, destination):
         if source:
             destination.append(self.snapshot())
-            self.clips, self.highlights, self.mix, self.voice, self.music, waves = source.pop()
+            (self.clips, self.highlights, self.mix, self.voice, self.music, waves, self.script,
+             self.script_approved, self.director_language, self.director_mode, self.generated_voice) = source.pop()
             self.waves.update({key: waves[key] for key in ("voice", "music")})
             self.sync_mix()
             self.invalidate_preview()
@@ -719,6 +1000,9 @@ class Studio(QMainWindow):
     def set_clips(self, clips, *, record=True):
         if record:
             self.record_edit()
+        if self.script and clips != self.clips:
+            self.script_approved = False
+            self.drop_generated_voice()
         self.clips = clips
         self.invalidate_preview()
         self.refresh()
@@ -798,13 +1082,19 @@ class Studio(QMainWindow):
     def select_row(self, row):
         self.selected_clip_row = row
         self.update_edit_controls()
+        if self.script_panel.isVisible() and self.script:
+            clip = self.entries[row].segment
+            for index, section in enumerate(self.script):
+                if any((start, end) == (clip.start, clip.end) for start, end, _ in section.evidence):
+                    self.refresh_script(index)
+                    break
         self.timeline_scroll.ensureVisible(round(self.timeline.x_at(self.entries[row].position)), 0, 80, 0)
 
     def update_edit_controls(self, *_):
         row = self.selected_clip_row
         entry = self.entries[row] if 0 <= row < len(self.entries) else None
         original = entry is not None and entry.segment.highlight
-        self.replace_selected.setText("Replace highlight" if original else "Replace selected")
+        self.replace_selected.setText("Replace group" if original else "Replace")
         self.delete_selected.setText("Trim" if original else "Delete")
         self.timeline.selection = row
         self.timeline.update()
@@ -1126,6 +1416,7 @@ class Studio(QMainWindow):
             self.selected_clip_row = min(self.selected_clip_row, len(entries) - 1)
         self.update_edit_controls()
         self.refresh_scenes()
+        self.refresh_script()
         cursor = sum(clip.frames for clip in self.clips)
         self.timeline.update_regions()
         self.track_labels.update()
@@ -1143,8 +1434,12 @@ class Studio(QMainWindow):
         destination = Path(path)
         if destination.resolve() in {item.resolve() for item in (self.movie.path, self.voice, self.music) if item}:
             raise ValueError("Save the edit to a different file from the imported media.")
+        linked = director.placements(self.script, self.clips, self.movie.fps)
         atomic_json(destination, {
-            "version": 3, "mix": vars(self.mix), "movie": str(self.movie.path), "source_key": self.source_key,
+            "version": 4, "director": {"sections": [dict(vars(s), placements=linked[s.id]) for s in self.script],
+                                        "approved": self.script_approved, "mode": self.director_mode,
+                                        "language": self.director_language, "generated_voice": str(self.generated_voice) if self.generated_voice else None},
+            "mix": vars(self.mix), "movie": str(self.movie.path), "source_key": self.source_key,
             "voice": str(self.voice) if self.voice else None, "music": str(self.music) if self.music else None,
             "title": self.title.text(), "year": self.year.value(), "target": self.target.value(),
             "highlights": [[c.start, c.end, list(c.cuts), c.muted, c.role] for c in self.highlights],
@@ -1163,7 +1458,7 @@ class Studio(QMainWindow):
 
         def load(progress):
             payload = json.loads(Path(path).read_text(encoding="utf-8"))
-            if payload["version"] not in (1, 2, 3):
+            if payload["version"] not in (1, 2, 3, 4):
                 raise ValueError("Unsupported edit file version.")
             movie = inspect(Path(payload["movie"]))
             if identity(movie.path) != payload["source_key"]:
@@ -1205,6 +1500,13 @@ class Studio(QMainWindow):
             self.undo_stack.clear()
             self.redo_stack.clear()
             self.voice, self.music = tracks
+            saved = payload.get("director", {})
+            self.script = [director.ScriptSection.restore(section) for section in saved.get("sections", [])]
+            self.script_approved = saved.get("approved", False)
+            self.director_language = saved.get("language", "English")
+            self.director_mode = saved.get("mode", director.MODES[0])
+            self.generated_voice = Path(saved["generated_voice"]) if saved.get("generated_voice") else None
+            self.show_script_panel(bool(self.script))
             self.source_key = payload["source_key"]
             self.title.setText(payload["title"])
             self.year.setValue(payload["year"])
@@ -1215,6 +1517,26 @@ class Studio(QMainWindow):
             self.tabs.setCurrentIndex(1)
 
         self.background("Opening saved edit…", load, apply)
+
+    def check_recap_export(self):
+        self.require_movie(True)
+        self.check(self.clips)
+        path, _ = QFileDialog.getOpenFileName(self, "Check exported video", "", "MP4 video (*.mp4)")
+        if not path:
+            return
+        def work(progress):
+            progress("Running Video Recap Skills quality checks…")
+            report = director.quality_report(Path(path), self.movie, self.clips, self.script, self.voice, self.music)
+            output = Path(path).with_suffix(".check.json")
+            atomic_json(output, report)
+            return output, report.get("ok")
+
+        def done(result):
+            output, ok = result
+            label = "Checks passed; review any warnings." if ok else "Review the reported issues."
+            QMessageBox.information(self, "Video quality report", f"{label}\n{output}")
+
+        self.background("Checking exported video…", work, done)
 
     def export(self):
         self.require_movie(True)
