@@ -1,5 +1,5 @@
 """Exact-range video rendering and highlight-aware audio assembly."""
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from pathlib import Path
 from fractions import Fraction
 import hashlib
@@ -13,7 +13,14 @@ from .media import Media, ffmpeg, identity, invoke, seconds, video_seek
 from .model import Clip, MAX_CLIP_SECONDS, timeline_entries, validate
 
 RATE = 48000
-VERSION = "render-4"
+VERSION = "render-6"
+
+
+@dataclass(frozen=True)
+class Mix:
+    original: float = 1.0
+    voice: float = .92
+    music: float = .24
 
 
 def dimensions(movie: Media, preview: bool) -> tuple[int, int]:
@@ -33,6 +40,8 @@ def render_clip(movie: Media, clip: Clip, destination: Path, preview: bool):
            "-frames:v", str(clip.frames), "-r", str(movie.fps), "-fps_mode", "cfr",
            "-c:v", "libx264", "-threads", "3", "-preset", "ultrafast" if preview else "fast",
            "-crf", "25" if preview else "17", "-pix_fmt", "yuv420p",
+           # Independently encoded clips need identical decode/display order at every join.
+           "-bf", "0",
            "-video_track_timescale", str(movie.fps.numerator), str(destination))
     frames = invoke(["ffprobe", "-v", "error", "-select_streams", "v:0", "-show_entries",
                      "stream=nb_frames", "-of", "csv=p=0", str(destination)]).strip()
@@ -45,15 +54,15 @@ def audio_spans(clips: list[Clip]) -> list[tuple[bool, int, int]]:
     cursor = 0
     for clip in clips:
         end = cursor + clip.frames
-        if spans and not clip.highlight and not spans[-1][0]:
+        if spans and not clip.movie_audio and not spans[-1][0]:
             spans[-1] = (False, spans[-1][1], end)
         else:
-            spans.append((clip.highlight, cursor, end))
+            spans.append((clip.movie_audio, cursor, end))
         cursor = end
     return spans
 
 
-def audio_track(movie: Media, clips: list[Clip], voice: Path | None, music: Path | None, folder: Path) -> Path:
+def audio_track(movie: Media, clips: list[Clip], voice: Path | None, music: Path | None, folder: Path, mix: Mix | None = None, progress=lambda _: None) -> Path:
     def samples(frame):
         return round(frame * RATE / movie.fps)
 
@@ -67,13 +76,14 @@ def audio_track(movie: Media, clips: list[Clip], voice: Path | None, music: Path
                 if source.getnframes() == 0:
                     raise ValueError(f"The {name} track contains no audio samples.")
                 inputs[name] = normalized, source.getnframes()
-    originals = iter(clip for clip in clips if clip.highlight)
+    originals = iter(clip for clip in clips if clip.movie_audio)
     bed_cursor = 0
     output = folder / "audio.wav"
     spans = audio_spans(clips)
     with wave.open(str(output), "wb") as result:
         result.setparams((2, 2, RATE, 0, "NONE", "not compressed"))
         for index, (highlight, start, end) in enumerate(spans):
+            progress(f"Mixing audio region {index + 1} of {len(spans)}…")
             count = samples(end) - samples(start)
             target = folder / "span.wav"
             limit = f"apad=whole_len={count},atrim=end_sample={count}"
@@ -83,9 +93,20 @@ def audio_track(movie: Media, clips: list[Clip], voice: Path | None, music: Path
                 fade = min(round(.012 * RATE), count // 2)
                 edges = f"afade=t=in:ss=0:ns={fade},afade=t=out:ss={count - fade}:ns={fade}"
                 # Decode dialogue once across all the group's video cuts.
-                ffmpeg("-ss", seconds(timestamp), "-i", str(movie.path), "-map", "0:a:0", "-vn",
-                       "-af", f"aresample={RATE}:async=1:first_pts=0,{limit},{edges}",
-                       "-ac", "2", "-ar", str(RATE), str(target))
+                original = f"aresample={RATE}:async=1:first_pts=0,{limit},{edges}"
+                args = ["-ss", seconds(timestamp), "-i", str(movie.path)]
+                if mix and "music" in inputs:
+                    path, length = inputs["music"]
+                    args += ["-stream_loop", "-1", "-ss", seconds(Fraction(samples(start) % length, RATE)),
+                             "-i", str(path)]
+                    filters = (f"[0:a:0]{original},volume={mix.original}[dialogue];"
+                               f"[1:a:0]{limit},{edges},volume={mix.music * .18}[music];"
+                               "[dialogue][music]amix=inputs=2:normalize=0,alimiter=limit=0.98:level=false:latency=true[mix]")
+                    ffmpeg(*args, "-filter_complex", filters, "-map", "[mix]", "-ac", "2", "-ar", str(RATE), str(target))
+                else:
+                    gain = mix.original if mix else 1
+                    ffmpeg(*args, "-map", "0:a:0", "-vn", "-af", f"{original},volume={gain}",
+                           "-ac", "2", "-ar", str(RATE), str(target))
             else:
                 args = []
                 filters = []
@@ -93,17 +114,24 @@ def audio_track(movie: Media, clips: list[Clip], voice: Path | None, music: Path
                 for name, (path, length) in inputs.items():
                     if name == "voice" and bed_cursor >= length:
                         continue
-                    offset = bed_cursor if name == "voice" else bed_cursor % length
+                    offset = bed_cursor if name == "voice" else (samples(start) if mix else bed_cursor) % length
                     if name == "music":
                         args += ["-stream_loop", "-1"]
                     args += ["-ss", seconds(Fraction(offset, RATE)), "-i", str(path)]
                     fade_ins = f",afade=t=in:ss=0:ns={fade}" if index else ""
                     fade_outs = f",afade=t=out:ss={count - fade}:ns={fade}" if index < len(spans) - 1 else ""
                     gain = "0.92" if name == "voice" else "0.16"
+                    if mix:
+                        gain = mix.voice if name == "voice" else mix.music
+                        if name == "music":
+                            narration_samples = min(count, max(0, inputs.get("voice", (None, 0))[1] - bed_cursor))
+                            if narration_samples:
+                                gain = f"'if(lt(t,{narration_samples / RATE}),{gain * .5},{gain})':eval=frame"
                     filters.append(f"[{len(filters)}:a]{limit},volume={gain}{fade_ins}{fade_outs}[{name}]")
                 labels = "".join(f"[{name}]" for name in inputs if any(item.endswith(f"[{name}]") for item in filters))
                 if filters:
-                    filters.append(f"{labels}amix=inputs={len(filters)}:normalize=0[mix]")
+                    limiter = ",alimiter=limit=0.98:level=false:latency=true" if mix else ""
+                    filters.append(f"{labels}amix=inputs={len(filters)}:normalize=0{limiter}[mix]")
                     ffmpeg(*args, "-filter_complex", ";".join(filters), "-map", "[mix]",
                            "-ac", "2", "-ar", str(RATE), str(target))
                 else:
@@ -123,9 +151,9 @@ def preview_chunk(cache: Path, source_key: str, clip: Clip) -> Path:
 
 
 def render_selection(movie: Media, analysis: Analysis, clips: list[Clip], row: int,
-                     voice: Path | None, music: Path | None, cache: Path, progress) -> Path:
+                     voice: Path | None, music: Path | None, cache: Path, progress, *, mix: Mix | None = None) -> Path:
     entry = timeline_entries(clips, movie.fps)[row]
-    assembly = render(movie, analysis, clips, voice, music, cache, progress)
+    assembly = render(movie, analysis, clips, voice, music, cache, progress, mix=mix)
     destination = cache / f"{assembly.stem}-clip-{row + 1}.mp4"
     if destination.is_file():
         return destination
@@ -147,12 +175,13 @@ def render_selection(movie: Media, analysis: Analysis, clips: list[Clip], row: i
 
 
 def render(movie: Media, analysis: Analysis, clips: list[Clip], voice: Path | None,
-           music: Path | None, cache: Path, progress, *, destination: Path | None = None) -> Path:
+           music: Path | None, cache: Path, progress, *, destination: Path | None = None, mix: Mix | None = None) -> Path:
     preview = destination is None
     validate(clips, movie.fps, analysis.frames, final=not preview, has_audio=movie.has_audio)
     entries = timeline_entries(clips, movie.fps)
     identities = [identity(path) if path else None for path in (movie.path, voice, music)]
-    key_data = (VERSION, identities, [(c.start, c.end, c.highlight, c.cuts) for c in clips])
+    key_data = (VERSION, identities, [(c.start, c.end, c.highlight, c.cuts, c.original, c.muted) for c in clips],
+                (mix.original, mix.voice, mix.music) if mix else None)
     key = hashlib.sha256(json.dumps(key_data).encode()).hexdigest()
     destination = destination or cache / f"preview-{key}.mp4"
     if destination.resolve() in {path.resolve() for path in (movie.path, voice, music) if path}:
@@ -184,12 +213,13 @@ def render(movie: Media, analysis: Analysis, clips: list[Clip], voice: Path | No
         concat = folder / "clips.ffconcat"
         concat.write_text("\n".join(listing) + "\n", encoding="ascii")
         progress("Mixing narration, music and original-audio highlights…")
-        audio = audio_track(movie, clips, voice, music, folder)
+        audio = audio_track(movie, clips, voice, music, folder, mix, progress)
         intermediate = folder / "result.mp4"
         ffmpeg("-f", "concat", "-safe", "1", "-i", str(concat), "-i", str(audio),
                "-map", "0:v:0", "-map", "1:a:0", "-c:v", "copy", "-c:a", "aac", "-b:a", "256k",
                "-video_track_timescale", str(movie.fps.numerator), "-movflags", "+faststart", str(intermediate))
         if identities != [identity(path) if path else None for path in (movie.path, voice, music)]:
             raise ValueError("An imported file changed during rendering. Import the media again.")
+        progress("Finishing output…")
         intermediate.replace(destination)
     return destination

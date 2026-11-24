@@ -1,4 +1,6 @@
 from pathlib import Path
+from threading import Event, Timer
+from time import monotonic
 from fractions import Fraction
 from dataclasses import replace
 import json
@@ -12,9 +14,9 @@ import wave
 import numpy as np
 
 from movie_review_studio.analysis import analyze, fingerprint_highlight, thumbnail_path
-from movie_review_studio.media import ffmpeg, frame_clock, identity, inspect
-from movie_review_studio.model import Clip, timeline_entries
-from movie_review_studio.render import RATE, audio_track, dimensions, render, render_clip, render_selection
+from movie_review_studio.media import Cancelled, cancellation, ffmpeg, frame_clock, identity, inspect
+from movie_review_studio.model import Clip, timeline_entries, validate
+from movie_review_studio.render import Mix, RATE, audio_track, dimensions, render, render_clip, render_selection
 
 
 @unittest.skipUnless(shutil.which("ffmpeg") and shutil.which("ffprobe"), "Requires FFmpeg and ffprobe")
@@ -122,6 +124,28 @@ class MediaTests(unittest.TestCase):
         signal = np.frombuffer(selected_audio, dtype="<i2")[:RATE].astype(float)
         self.assertEqual(np.argmax(abs(np.fft.rfft(signal))), 880)
 
+    def test_adaptive_audio_ducks_music_and_keeps_narration_out_of_dialogue(self):
+        narration, music = self.root / "duck-voice.wav", self.root / "duck-music.wav"
+        ffmpeg("-f", "lavfi", "-i", "sine=f=660:d=1.0", str(narration))
+        ffmpeg("-f", "lavfi", "-i", "sine=f=220:d=1.0", str(music))
+        clips = [Clip(0, 24, 0, (), (), ()), Clip(30, 54, 0, (), (), (), original=True)]
+        folder = self.root / "duck"
+        folder.mkdir()
+        path = audio_track(self.media, clips, narration, music, folder, Mix())
+        with wave.open(str(path), "rb") as stream:
+            self.assertEqual(stream.getnframes(), 4 * RATE)
+            signal = np.frombuffer(stream.readframes(4 * RATE), dtype="<i2")[::2].astype(float)
+
+        def energy(at, hz):
+            samples = signal[round(at * RATE):round((at + .25) * RATE)]
+            return abs(np.fft.rfft(samples)[hz // 4])
+
+        self.assertGreater(energy(.25, 660), 1_000_000)
+        self.assertGreater(energy(2.5, 880), 1_000_000)
+        self.assertLess(energy(2.5, 660), energy(.25, 660) / 50)
+        self.assertGreater(energy(1.25, 220), energy(.25, 220) * 1.7)
+        self.assertGreater(energy(.25, 220), energy(2.5, 220) * 1.7)
+
     def test_fractional_fps_cuts(self):
         path = self.root / "fractional.mkv"
         ffmpeg("-f", "lavfi", "-i", "testsrc2=size=96x64:rate=24000/1001:duration=3",
@@ -135,6 +159,37 @@ class MediaTests(unittest.TestCase):
         output = render(media, analysis, clips, None, None, self.root, lambda _: None)
         self.assertEqual(inspect(output).fps, media.fps)
         self.assertEqual(frame_clock(inspect(output))[0], 72)
+
+    def test_cancel_interrupts_a_running_media_command(self):
+        stop = Event()
+        token = cancellation.set(stop)
+        alarm = Timer(.4, stop.set)
+        started = monotonic()
+        alarm.start()
+        try:
+            with self.assertRaises(Cancelled):
+                ffmpeg("-re", "-f", "lavfi", "-i", "anullsrc", "-t", "10", "-f", "null", "-")
+        finally:
+            alarm.cancel()
+            cancellation.reset(token)
+        self.assertLess(monotonic() - started, 5)
+
+    def test_export_keeps_frame_clock_at_mixed_length_joins(self):
+        source = self.root / "mixed-length-source.mp4"
+        ffmpeg("-f", "lavfi", "-i", "testsrc2=size=96x64:rate=1:duration=16",
+               "-c:v", "libx264", str(source))
+        media = inspect(source)
+        analysis = analyze(media, self.root, lambda _: None)
+        clips = [Clip(start, end, 0, (), (), ()) for start, end in ((0, 5), (6, 8), (10, 15))]
+        export = self.root / "mixed-length-export.mp4"
+
+        def short_fixture(items, fps, frames, *, final, has_audio):
+            self.assertTrue(final)
+            validate(items, fps, frames, has_audio=has_audio)
+
+        with patch("movie_review_studio.render.validate", side_effect=short_fixture):
+            render(media, analysis, clips, None, None, self.root, lambda _: None, destination=export, mix=Mix())
+        self.assertEqual(frame_clock(inspect(export))[0], 12)
 
     def test_editor_scene_controls_and_project_round_trip(self):
         from PySide6.QtWidgets import QApplication, QMessageBox
@@ -153,40 +208,49 @@ class MediaTests(unittest.TestCase):
         studio.highlights = [highlight]
         studio.set_clips([candidates[0], highlight, candidates[2]])
 
-        self.assertEqual(studio.scenes.item(0, 4).text(), "Selected")
-        self.assertEqual(studio.scenes.item(1, 4).text(), "Highlight")
-        self.assertEqual(studio.scenes.item(3, 4).text(), "Unused")
+        self.assertIn("Selected", studio.scene_model.rows[0][2])
+        self.assertIn("Original audio", studio.scene_model.rows[1][2])
+        self.assertIn("Unused", studio.scene_model.rows[3][2])
         studio.scene_search.setText("unused")
-        self.assertTrue(studio.scenes.isRowHidden(0))
-        self.assertFalse(studio.scenes.isRowHidden(3))
-        studio.table.selectRow(4)
-        studio.scenes.selectRow(3)
-        studio.replace_with_candidate()
-        studio.move_clip(-1)
-        studio.scenes.selectRow(4)
-        studio.add_candidate()
-        studio.delete_clip()
+        self.assertEqual([item[0] for item in studio.scene_model.rows], [3, 4])
+        with patch.object(studio, "preview_candidate"):
+            studio.select_row(4)
+            studio.scene_grid.setCurrentIndex(studio.scene_model.index(0, 0))
+            studio.replace_with_candidate()
+            studio.reorder(4, 1)
+            studio.scene_grid.setCurrentIndex(studio.scene_model.index(0, 0))
+            studio.add_candidate()
+            studio.delete_clip()
         self.assertEqual(studio.clips, [candidates[0], candidates[3], highlight])
-        self.assertEqual(studio.table.rowCount(), 5)
-        self.assertEqual([studio.table.item(2, col).text() for col in (1, 2, 3, 4, 6)],
-                         ["00:00:02.000", "00:00:05.000", "00:00:02.000", "00:00:05.000", "ORIGINAL"])
-        studio.table.selectRow(1)
+        self.assertEqual(len(studio.entries), 5)
+        studio.select_row(2)
+        self.assertIn("00:00:02.000 – 00:00:05.000", studio.inspector_details.text())
+        self.assertIn("Original movie audio", studio.inspector_details.text())
+        studio.select_row(1)
+        studio.toggle_clip_audio()
+        self.assertTrue(studio.clips[1].movie_audio)
+        studio.undo()
+        self.assertFalse(studio.clips[1].movie_audio)
+        studio.redo()
+        self.assertTrue(studio.clips[1].movie_audio)
+        studio.undo()
+        studio.select_row(1)
         studio.montage_playback = True
         studio.position_changed(5250)
         self.assertEqual(studio.active_row, 3)
-        self.assertEqual(studio.table.currentRow(), 1)
+        self.assertEqual(studio.selected_clip_row, 1)
 
         audio = self.root / "project-audio.wav"
         ffmpeg("-f", "lavfi", "-i", "sine=f=220:d=1", str(audio))
         studio.voice = studio.music = audio
         studio.title.setText("Edited review")
         studio.year.setValue(2026)
-        studio.target.setValue(18)
+        studio.target.setValue(1080)
         project = self.root / "test-project.mrs.json"
         with patch("movie_review_studio.app.QFileDialog.getSaveFileName", return_value=(str(project), "")):
             studio.save_project()
         expected = studio.clips[:]
-        self.assertEqual(json.loads(project.read_text(encoding="utf-8"))["highlights"], [[24, 144, [60, 120]]])
+        self.assertEqual(json.loads(project.read_text(encoding="utf-8"))["highlights"], [[24, 144, [60, 120], False, ""]])
 
         def run_job(_message, operation, complete):
             complete(operation(lambda _: None))
@@ -199,11 +263,12 @@ class MediaTests(unittest.TestCase):
             studio.open_project()
             self.assertEqual(studio.clips, expected)
             legacy = json.loads(project.read_text(encoding="utf-8"))
-            legacy.update(version=1, highlights=[[24, 144]])
+            legacy.update(version=1, target=18, highlights=[[24, 144]],
+                          clips=[item[:3] for item in legacy["clips"]])
             project.write_text(json.dumps(legacy), encoding="utf-8")
             studio.open_project()
         self.assertEqual(studio.clips, expected)
         self.assertEqual([entry.segment.highlight for entry in studio.entries], [False, False, True, True, True])
         self.assertEqual((studio.voice, studio.music, studio.title.text(), studio.year.value(), studio.target.value()),
-                         (audio, audio, "Edited review", 2026, 18))
+                         (audio, audio, "Edited review", 2026, 1080))
         application.processEvents()

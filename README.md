@@ -19,16 +19,18 @@ The **Windows x64 package** GitHub Actions workflow tests the first-launch insta
 
 ## Create a review
 
-1. **Import.** Enter the title and year, then import a local MP4, MKV or MOV from a source you have the right to use. Check the detected resolution, FPS and duration. Add an optional MP3 or WAV narration and a background track. Choose a target of 16, 17 or 18 minutes and analyze the movie.
-2. **Cut.** Add two or three highlights. Enter each start time relative to the first movie frame or use **Source preview** and **Use source playhead**. Choose a 10–15 second duration and preview each highlight before generating the montage. Use the highlight selector to replace or remove a highlight.
-3. Generate one montage. The timeline shows the actual output order, source and montage ranges, duration, and movie-audio mode for every video segment. Select a row to preview, replace, delete, or move a clip. Use **Play assembly** and drag either playhead to scrub. The preview shows which clip is active without changing the selected row.
-4. Open **Scenes** to search analyzed footage by source time, scene number, or status. Select a candidate to preview it, append it to the timeline, or replace a selected muted clip.
-5. Save the edit as an `.mrs.json` file and reopen it from **Import**. The edit references local files by path, so keep the source files in place. Older Stage 1 edits are split into short video segments when opened.
-6. **Final.** Validate and export one H.264/AAC MP4, scaled to fit within 1920×1080 at the source frame rate. The exporter reports duplicate, duration and highlight validation failures before rendering.
+1. In **Import**, select a local movie you have permission to edit. Pick a target from 17:00 to 18:00. The default is 17:30.
+2. Click **Auto Generate Movie Review**. The editor analyzes the source and arranges usable shots in source order. Audio evidence can suggest up to three continuous original-audio highlight groups. Generation can use entirely muted footage when a suitable highlight is unavailable.
+3. In **Smart Editor**, click a timeline segment to inspect its source frame and metadata. Use **Play review** for the encoded assembly, or **Preview** in the inspector for the selected clip with its assembly audio. Drag clips to reorder them, drag the ruler to scrub, and use **Undo** and **Redo** to revisit edits. Highlights move as continuous groups even though their internal video segments are visible.
+4. Optionally import narration and music using the inspector. Blue video denotes the narration track or its placeholder, orange uses movie audio, and purple marks clips labeled Intro or Outro. Green shows background music. The three audio tracks show placement and real waveform peaks. Narration pauses during movie dialogue, and music is reduced during narration and original-audio sections.
+5. Expand **Scenes** for thumbnails, source-time search, filters, and recommended replacements. Select a scene to preview it, then use **Add scene** or **Replace clip**. Open **Manual highlights** to define, preview, replace, or remove a continuous highlight.
+6. Use **Save project** to save the edit as an `.mrs.json` file. Older project files can still be opened. Projects reference media by path and save clip order, audio modes, and volume. Open **Export** to render H.264/AAC MP4 at up to 1920×1080.
 
-Every video segment lasts at most five seconds. A 10–15-second highlight is split at detected shot boundaries where possible, with continuous dialogue from the source movie's first audio stream. Highlights move and replace as a group. An outer segment can be trimmed if the remaining range is at least 10 seconds. Narration and looping music advance during muted footage and pause during highlights. Audio fades at the transition between the two modes. Narration plays once and may run out or be longer than the available muted footage.
+Each video segment is at most five seconds. A highlight keeps its source dialogue in order and uses short fades at the group's audio edges. Shot analysis, preview encoding, and export run in workers. Use **Cancel** to interrupt processing. The first montage or selected-clip preview may take time to encode. Qt stores the cache and `studio.log` in the app-local data directory, typically `%LOCALAPPDATA%\Movie Review Studio` on Windows.
 
-Shot analysis, preview encoding and export run in background workers. Analysis, scene thumbnails and low-resolution previews are cached. The first **Play selected** after editing may need to encode the assembly so the clip can use its actual montage audio. Qt stores the cache and `studio.log` in the app-local data directory, typically `%LOCALAPPDATA%\Movie Review Studio` on Windows. Close the app before clearing its cache. Cache use and render time depend on the length of the movie and number of edits.
+### Optional local dialogue evidence
+
+The editor uses timing from a same-name SRT/VTT file or an embedded text subtitle stream when available. For local speech transcription, set `MRS_WHISPER_CLI` and `MRS_WHISPER_MODEL` to your local whisper.cpp executable and model paths. Choose a multilingual model for automatic language detection. The app uses the resulting timestamps as dialogue cues. Without them, it uses audio activity and visual cues. These signals are heuristic and do not establish what a character says, how they feel, or the cultural meaning of a scene.
 
 ## Tests
 
@@ -38,10 +40,10 @@ Run from Command Prompt after installation.
 .venv\Scripts\python.exe -m unittest discover -s tests -v
 ```
 
-The suite exercises duplicate and overlap rejection, replacement, duration checks, full timeline generation, shot-boundary cuts, fractional frame rates, caching and the narration/music/movie audio transitions. FFmpeg integration tests generate their own media and skip if FFmpeg or ffprobe is unavailable.
+The suite covers automatic generation, chronological placement, duplicate and overlap rejection, duration checks, shot-boundary cuts, fractional frame rates, cache use, project compatibility, undo/redo, and audio transitions. FFmpeg integration tests generate their own media and skip if FFmpeg or ffprobe is unavailable.
 
 ## Design and current limits
 
 - The editor uses a verified constant-rate frame clock and half-open source ranges. Variable-frame-rate and rotated inputs should be converted before analysis. The first video stream must be the movie. Source preview uses Qt Multimedia and depends on decoder support.
 - PySceneDetect identifies shot boundaries. OpenCV measures motion, exposure, sharpness and edge structure and computes perceptual fingerprints. Black-frame and credit filtering and near-duplicate detection are heuristic. Gradual transitions, stylized credits and heavily altered repetitions can require manual review. Short, repetitive or low-quality sources may lack enough usable material to reach 16 minutes.
-- `analysis.py` indexes source frames, shot cuts, thumbnails and candidates. `model.py` owns validation, selection and segment layout. `render.py` consumes validated edit decisions and handles audio routing. Highlights use manually selected continuous source ranges.
+- `analysis.py` indexes source frames, shot cuts, thumbnails and candidates. `model.py` owns validation, selection and segment layout. `render.py` consumes validated edit decisions and handles audio routing. Suggested and manual highlights both use continuous source ranges.

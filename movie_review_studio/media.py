@@ -1,4 +1,5 @@
 """FFmpeg integration and media identity."""
+from contextvars import ContextVar
 from dataclasses import dataclass
 from fractions import Fraction
 from pathlib import Path
@@ -7,6 +8,13 @@ import json
 import logging
 import subprocess
 import sys
+
+
+class Cancelled(Exception):
+    pass
+
+
+cancellation = ContextVar("media_cancellation", default=None)
 
 
 @dataclass(frozen=True)
@@ -28,15 +36,31 @@ def tool_path(name: str) -> str:
 
 
 def invoke(args: list[str], *, binary: bool = False):
-    process = subprocess.run(
-        [tool_path(args[0]), *args[1:]], capture_output=True,
-        creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0,
-    )
-    if process.returncode:
-        message = process.stderr.decode("utf-8", "replace").strip()
+    command = [tool_path(args[0]), *args[1:]]
+    flags = subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
+    stop = cancellation.get()
+    if stop is None:
+        result = subprocess.run(command, capture_output=True, creationflags=flags)
+        stdout, stderr, code = result.stdout, result.stderr, result.returncode
+    else:
+        if stop.is_set():
+            raise Cancelled()
+        with subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, creationflags=flags) as process:
+            while True:
+                try:
+                    stdout, stderr = process.communicate(timeout=.25)
+                    code = process.returncode
+                    break
+                except subprocess.TimeoutExpired:
+                    if stop.is_set():
+                        process.kill()
+                        process.communicate()
+                        raise Cancelled()
+    if code:
+        message = stderr.decode("utf-8", "replace").strip()
         logging.error("%s failed: %s", args[0], message)
-        raise RuntimeError(message.splitlines()[-1] if message else f"{args[0]} exited with {process.returncode}.")
-    return process.stdout if binary else process.stdout.decode("utf-8", "replace")
+        raise RuntimeError(message.splitlines()[-1] if message else f"{args[0]} exited with {code}.")
+    return stdout if binary else stdout.decode("utf-8", "replace")
 
 
 def inspect(path: Path, *, video: bool = True) -> Media:

@@ -15,7 +15,7 @@ from .model import Clip, MAX_CLIP_SECONDS, Signature, highlight_cuts, video_segm
 
 WIDTH, HEIGHT = 320, 180
 FRAME_BYTES = WIDTH * HEIGHT * 3
-VERSION = "analysis-5"
+VERSION = "analysis-6"
 
 
 @dataclass(frozen=True)
@@ -75,7 +75,7 @@ def measure(frame, previous):
 def clip_from_dict(item):
     return Clip(item["start"], item["end"], item["score"],
                 *(tuple(Signature(**entry) for entry in item[key]) for key in ("first", "last", "samples")),
-                highlight=item["highlight"], shot=item["shot"])
+                highlight=item["highlight"], shot=item["shot"], production_card=item.get("production_card", False))
 
 
 def atomic_json(path: Path, payload):
@@ -119,12 +119,18 @@ def analyze(media: Media, cache: Path, progress) -> Analysis:
     start = 0
     shot = 0
     shot_starts = []
+    cascade_path = Path(cv2.data.haarcascades) / "haarcascade_frontalface_default.xml"
+    faces = cv2.CascadeClassifier(str(cascade_path)) if cascade_path.is_file() else None
 
     def finish():
         if len(fingerprints) >= minimum and metrics:
             quality, unusable, credits = np.mean(metrics, axis=0)
             if unusable < .32 and credits < (.45 if start > .85 * count else .70):
-                candidates.append(make_clip(start, fingerprints, float(quality), shot))
+                gray = cv2.cvtColor(first_frame, cv2.COLOR_BGR2GRAY)
+                face_count = len(faces.detectMultiScale(gray, 1.18, 4, minSize=(25, 25))) if faces is not None and not faces.empty() else 0
+                card = start < min(count * .06, 90 * media.fps) and credits >= .40 and face_count == 0
+                candidate = make_clip(start, fingerprints, float(quality) + .65 * min(face_count, 2), shot)
+                candidates.append(replace(candidate, production_card=bool(card)))
                 save_thumbnail(cache, key, start, first_frame)
         fingerprints.clear()
         metrics.clear()

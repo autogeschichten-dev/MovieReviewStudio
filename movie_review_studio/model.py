@@ -27,6 +27,15 @@ class Clip:
     shot: int | None = None
     cuts: tuple[int, ...] = ()  # Internal video boundaries of a continuous highlight.
 
+    original: bool = False
+    production_card: bool = False
+    muted: bool = False
+    role: str = ""
+
+    @property
+    def movie_audio(self):
+        return (self.highlight and not self.muted) or self.original
+
     @property
     def frames(self):
         return self.end - self.start
@@ -115,6 +124,8 @@ def validate(clips: list[Clip], fps: Fraction, source_frames: int, *,
         if not 0 <= clip.start < clip.end <= source_frames:
             raise ValueError(f"Clip {number} lies outside the source.")
         duration = clip.frames / fps
+        if clip.movie_audio and not has_audio:
+            raise ValueError(f"Clip {number} needs movie audio.")
         if clip.highlight:
             highlights += 1
             if not has_audio or not 10 <= duration <= 15:
@@ -129,8 +140,8 @@ def validate(clips: list[Clip], fps: Fraction, source_frames: int, *,
     for (a, left), (b, right) in zip(ordered, ordered[1:]):
         if overlaps(left, right):
             raise ValueError(f"Clips {a} and {b} overlap or reuse the same source frames.")
-    if highlights > 3 or (final and highlights < 2):
-        raise ValueError("The final montage requires 2–3 original-audio highlights.")
+    if highlights > 3:
+        raise ValueError("The montage supports up to three original-audio highlight groups.")
     if final and not 960 <= sum(clip.frames for clip in clips) / fps <= 1080:
         raise ValueError("The final montage must be 16–18 minutes including highlights.")
 
