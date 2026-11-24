@@ -297,7 +297,7 @@ def plan(movie, analysis, highlights, provider, mode, language, target, custom, 
             indexed[shot_id] = clip
             if observations is not None:
                 item = observations[clip.start]
-                facts = [fact[:95] for field in ("visible_facts", "actions", "characters", "environment", "objects", "expressions")
+                facts = ([item["description"][:240]] if item.get("description") else []) + [fact[:95] for field in ("visible_facts", "actions", "characters", "environment", "objects", "expressions")
                          for fact in item.get(field, [])[:1]]
                 evidence = {"id": shot_id, "range": [item["source_in"], item["source_out"]],
                             "shown_at": item["timestamp"], "visible": "; ".join(facts)[:330],
@@ -329,7 +329,7 @@ def plan(movie, analysis, highlights, provider, mode, language, target, custom, 
             observation = item["observation"].strip()[:1200]
             if observations is not None:
                 local = observations[indexed[item["id"]].start]
-                facts = [fact for field in ("visible_facts", "actions", "characters", "objects", "environment", "expressions")
+                facts = ([local["description"]] if local.get("description") else []) + [fact for field in ("visible_facts", "actions", "characters", "objects", "environment", "expressions")
                          for fact in local.get(field, [])]
                 observation = "Observed: " + "; ".join(facts[:6])
             choices[item["id"]] = observation

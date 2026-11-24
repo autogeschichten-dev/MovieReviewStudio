@@ -24,6 +24,7 @@ from PySide6.QtWidgets import (
 from .analysis import analyze, atomic_json, fingerprint_highlight
 from .media import Cancelled, cancellation, identity, inspect, invoke
 from . import director, local_ai
+from .ai_settings import AISettingsDialog, model_choices, settings
 from .editor import SceneModel, Timeline, TrackLabels, thumbnail
 from .model import adjacent_conflict, overlaps, replacement, timeline_entries, validate
 from .render import Mix, render, render_selection
@@ -32,6 +33,7 @@ from .smart import AudioEvidence, LocalWhisper, assemble, audio_evidence, sugges
 
 class JobSignals(QObject):
     progress = Signal(str)
+    observation = Signal(object)
     result = Signal(object)
     error = Signal(str)
 
@@ -46,7 +48,10 @@ class Job(QRunnable):
     def report(self, message):
         if self.cancel.is_set():
             raise Cancelled()
-        self.signals.progress.emit(message)
+        if isinstance(message, dict):
+            self.signals.observation.emit(message)
+        else:
+            self.signals.progress.emit(message)
 
     def run(self):
         token = cancellation.set(self.cancel)
@@ -193,6 +198,21 @@ class Studio(QMainWindow):
         self.cancel_button.hide()
         work_status.addWidget(self.cancel_button)
         layout.addLayout(work_status)
+        observation = QHBoxLayout()
+        self.vision_image = QLabel()
+        self.vision_image.setFixedSize(160, 90)
+        self.vision_image.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        observation.addWidget(self.vision_image)
+        self.vision_text = QPlainTextEdit()
+        self.vision_text.setReadOnly(True)
+        self.vision_text.setFixedHeight(90)
+        observation.addWidget(self.vision_text, 1)
+        dismiss = QPushButton("Hide")
+        dismiss.clicked.connect(lambda: self.vision_panel.hide())
+        observation.addWidget(dismiss)
+        self.vision_panel = self.panel(observation)
+        self.vision_panel.hide()
+        layout.addWidget(self.vision_panel)
         self.setCentralWidget(self.panel(layout))
         for shortcut, action in ((QKeySequence.StandardKey.Undo, self.undo), (QKeySequence.StandardKey.Redo, self.redo)):
             QShortcut(QKeySequence(shortcut), self, activated=lambda fn=action: self.perform(fn))
@@ -245,6 +265,7 @@ class Studio(QMainWindow):
         form.addRow("Target duration", self.import_target)
         form.addRow(self.analyze_button)
         form.addRow(self.button("Analyze Movie / Generate AI Review…", self.open_director))
+        form.addRow(self.button("AI Settings…", self.open_ai_settings))
         self.analysis_label = QLabel()
         self.analysis_label.setWordWrap(True)
         form.addRow("Analysis", self.analysis_label)
@@ -293,6 +314,7 @@ class Studio(QMainWindow):
         generate.setObjectName("primary")
         header.addWidget(generate)
         header.addWidget(self.button("AI Director…", self.open_director))
+        header.addWidget(self.button("AI Settings…", self.open_ai_settings))
         header.addWidget(self.button("Save project", self.save_project))
         self.smart_page.addLayout(header)
         self.editor_status = QLabel()
@@ -353,6 +375,25 @@ class Studio(QMainWindow):
         panel.setMinimumWidth(255)
         return panel
 
+    def open_ai_settings(self):
+        AISettingsDialog(self, Job).exec()
+
+    def show_observation(self, row):
+        if row["image"]:
+            pixmap = QPixmap()
+            if pixmap.loadFromData(row["image"]):
+                self.vision_image.setPixmap(pixmap.scaled(self.vision_image.size(),
+                    Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation))
+        else:
+            self.vision_image.clear()
+            self.vision_image.setText("No saved still")
+        self.vision_text.setPlainText(
+            f"Visual analysis {row['processed']}/{row['total']} · {row['successful']} successful · "
+            f"{row['failed']} skipped/failed · source {clock(row['seconds'])}\n"
+            f"Elapsed {clock(row['elapsed'])} · ETA {clock(row['eta'])}\n"
+            f"{row['description']}")
+        self.vision_panel.show()
+
     def open_director(self):
         from PySide6.QtWidgets import QCheckBox, QDialog, QDialogButtonBox
         self.require_movie()
@@ -375,25 +416,26 @@ class Studio(QMainWindow):
         connection = QLabel("Checking Ollama at 127.0.0.1:11434…")
         form.addRow("Ollama", connection)
         visual = QComboBox()
-        visual.addItem(local_ai.DEFAULT_MODEL)
+        stored = settings()
+        visual.addItem(stored.value("vision", local_ai.DEFAULT_MODEL, str))
         form.addRow("Visual model", visual)
         reasoning = QComboBox()
         reasoning.setEditable(True)
-        reasoning.setCurrentText(os.getenv("MRS_TEXT_MODEL", ""))
+        reasoning.setCurrentText(stored.value("text", os.getenv("MRS_TEXT_MODEL", "qwen2.5:3b"), str))
         form.addRow("Text reasoning model", reasoning)
         whisper = QComboBox()
         whisper.addItems(["base", "small"])
+        whisper.setCurrentText(stored.value("speech", "base", str))
+        whisper.currentTextChanged.connect(lambda value: AISettingsDialog.store("speech", value))
         form.addRow("Speech model (CPU)", whisper)
         def list_models(result):
             version, installed = result
             connection.setText(f"Connected · {version} · {len(installed)} models")
-            previous = reasoning.currentText()
-            visual.clear()
-            visual.addItems([name for name in installed if "moondream" in name.lower()] or [local_ai.DEFAULT_MODEL])
-            reasoning.clear()
-            reasoning.addItem("")
-            reasoning.addItems([name for name in installed if "moondream" not in name.lower()])
-            reasoning.setCurrentText(previous)
+            chosen = visual.currentText(), reasoning.currentText()
+            for combo, saved, names in zip((visual, reasoning), chosen, model_choices(installed, *chosen)):
+                combo.clear()
+                combo.addItems(names)
+                combo.setCurrentText(saved if saved in names else names[0])
         discovery = Job(lambda _: local_ai.discover())
         discovery.signals.result.connect(lambda result: list_models(result) if dialog.isVisible() else None)
         discovery.signals.error.connect(lambda _: connection.setText("Unavailable · start Ollama locally") if dialog.isVisible() else None)
@@ -432,6 +474,9 @@ class Studio(QMainWindow):
             return
         provider = director.VisionProvider.from_environment(reasoning.currentText(), text_only=True) if action == "generate" else None
         visual_model, speech_model = visual.currentText(), whisper.currentText()
+        AISettingsDialog.store("vision", visual_model)
+        AISettingsDialog.store("text", reasoning.currentText())
+        self.vision_panel.hide()
         if provider and provider.cloud:
             consent = QMessageBox.question(self, "Allow cloud processing?",
                 f"Send scene descriptions, transcript excerpts and script text to {provider.url}? "
@@ -462,32 +507,44 @@ class Studio(QMainWindow):
             vision = local_ai.VisionBatch(self.movie, analysis, self.cache, visual_model, models[visual_model])
             def observations(clips, report):
                 try:
-                    return vision.describe(clips, report)
-                finally:
-                    vision.unload()
+                    result = vision.describe(clips, report, observe=report)
+                except Exception:
+                    try:
+                        vision.unload()
+                    except RuntimeError:
+                        logging.warning("Could not unload the vision model after failure.")
+                    raise
+                vision.unload()
+                return result
             if action == "analyze":
                 candidates = [clip for clip in analysis.candidates if not clip.production_card]
                 selected = [clip for group in director.chapters(candidates, 16) for clip in director.sample_group(group)]
                 count = len(observations(selected, progress))
-                return analysis, audio, count, transcript["provider"]
+                return analysis, audio, count, transcript["provider"], vision.failed
             try:
                 clips, script = director.plan(self.movie, analysis, highlights, provider, content_mode, lang,
                                               target, text, self.cache, progress, observations=observations,
                                               transcript=cues)
-            finally:
+            except Exception:
                 if local_planner:
-                    local_ai.release_model(provider.model)
-            return analysis, audio, highlights, clips, script
+                    try:
+                        local_ai.release_model(provider.model)
+                    except RuntimeError:
+                        logging.warning("Could not unload the text model after failure.")
+                raise
+            if local_planner:
+                local_ai.release_model(provider.model)
+            return analysis, audio, highlights, clips, script, vision.failed
 
         def apply(result):
             if action == "analyze":
-                self.analysis, self.waves["original"], count, transcript_source = result
+                self.analysis, self.waves["original"], count, transcript_source, failed = result
                 self.refresh()
-                self.statusBar().showMessage(f"Analysis cached · {count} scenes · dialogue source: {transcript_source}")
+                self.statusBar().showMessage(f"Analysis cached · {count} scenes · {failed} skipped/failed · dialogue: {transcript_source}")
                 return
             self.record_edit()
             self.drop_generated_voice()
-            self.analysis, self.waves["original"], self.highlights, self.clips, self.script = result
+            self.analysis, self.waves["original"], self.highlights, self.clips, self.script, failed = result
             self.director_mode, self.director_language = content_mode, lang
             self.script_approved = False
             self.source_playback = False
@@ -495,7 +552,7 @@ class Studio(QMainWindow):
             self.tabs.setCurrentIndex(1)
             self.show_script_panel(True)
             self.refresh()
-            self.statusBar().showMessage("AI draft ready for source and script review.")
+            self.statusBar().showMessage(f"AI draft ready · {failed} skipped or failed scenes · review evidence and script.")
 
         self.background("Preparing local analysis…" if action == "analyze" else "Preparing grounded AI review…", work, apply)
 
@@ -815,6 +872,7 @@ class Studio(QMainWindow):
                 stage, estimate = "", None
             show_time()
         self.job.signals.progress.connect(update_progress)
+        self.job.signals.observation.connect(self.show_observation)
         timer.timeout.connect(show_time)
         timer.start(1000)
 
