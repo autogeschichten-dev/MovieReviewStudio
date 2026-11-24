@@ -200,6 +200,10 @@ class Studio(QMainWindow):
         self.cancel_button.hide()
         work_status.addWidget(self.cancel_button)
         layout.addLayout(work_status)
+        self.evidence_status = QLabel()
+        self.evidence_status.setWordWrap(True)
+        self.evidence_status.hide()
+        layout.addWidget(self.evidence_status)
         observation = QHBoxLayout()
         self.vision_image = QLabel()
         self.vision_image.setFixedSize(160, 90)
@@ -450,6 +454,20 @@ class Studio(QMainWindow):
         whisper.setCurrentText(stored.value("speech", "base", str))
         whisper.currentTextChanged.connect(lambda value: AISettingsDialog.store("speech", value))
         form.addRow("Speech model (CPU)", whisper)
+        subtitle_path = QLineEdit()
+        subtitle_path.setPlaceholderText("Auto-detect embedded or same-name subtitles")
+        subtitle_row = QHBoxLayout()
+        subtitle_row.addWidget(subtitle_path, 1)
+        def choose_subtitles():
+            name, _ = QFileDialog.getOpenFileName(dialog, "Select subtitles", "", "Subtitles (*.srt *.vtt)")
+            if name:
+                subtitle_path.setText(name)
+        subtitle_row.addWidget(self.button("Browse…", choose_subtitles))
+        form.addRow("Subtitle file", subtitle_row)
+        ocr = QCheckBox("Try local OCR for burned-in English subtitles")
+        translate = QCheckBox("Translate recognized speech into English")
+        form.addRow(ocr)
+        form.addRow(translate)
         def list_models(result):
             version, installed = result
             connection.setText(f"Connected · {version} · {len(installed)} models")
@@ -518,6 +536,8 @@ class Studio(QMainWindow):
         content_mode, lang, text = mode.currentText(), language.currentText(), code.toPlainText()
         target = self.target.value()
         include_highlights = highlights_enabled.isChecked()
+        chosen_subtitles = subtitle_path.text().strip() or None
+        use_ocr, use_translation = ocr.isChecked(), translate.isChecked()
 
         source_key = self.source_key
         report_path = self.cache / f"ai-planning-{source_key}.txt"
@@ -528,7 +548,12 @@ class Studio(QMainWindow):
             _, models = local_ai.discover()
             if visual_model not in models or "moondream" not in visual_model.lower():
                 raise ValueError(f"Install {visual_model} in Ollama before running visual analysis.")
-            transcript = local_ai.dialogue(self.movie, self.cache, progress, speech_model)
+            transcript = local_ai.dialogue(self.movie, self.cache, progress, speech_model,
+                                           subtitle_file=chosen_subtitles, ocr=use_ocr, translate=use_translation)
+            from .dialogue import coverage
+            dialogue_status = (f"{transcript['provider']} · {len(transcript['segments'])} cues · "
+                               f"{coverage(transcript['segments'], self.movie.duration):.1f}% of source time")
+            progress(f"Dialogue evidence · {dialogue_status}")
             audio = (audio_evidence(self.movie.path, self.cache, progress, movie=True)
                      if self.movie.has_audio else AudioEvidence())
             cues = transcript["segments"]
@@ -555,7 +580,7 @@ class Studio(QMainWindow):
                 candidates = [clip for clip in analysis.candidates if not clip.production_card]
                 selected = [clip for group in director.chapters(candidates, 16) for clip in director.sample_group(group)]
                 count = len(observations(selected, progress))
-                return analysis, audio, count, transcript["provider"], vision.failed
+                return analysis, audio, count, dialogue_status, vision.failed
             try:
                 clips, script = director.plan(self.movie, analysis, highlights, provider, content_mode, lang,
                                               target, text, self.cache, progress, observations=observations,
@@ -569,7 +594,7 @@ class Studio(QMainWindow):
                 raise
             if local_planner:
                 local_ai.release_model(provider.model)
-            return analysis, audio, highlights, clips, script, vision.failed
+            return analysis, audio, highlights, clips, script, vision.failed, dialogue_status
 
         def apply(result):
             if action == "analyze":
@@ -579,7 +604,7 @@ class Studio(QMainWindow):
                 return
             self.record_edit()
             self.drop_generated_voice()
-            self.analysis, self.waves["original"], self.highlights, self.clips, self.script, failed = result
+            self.analysis, self.waves["original"], self.highlights, self.clips, self.script, failed, dialogue_status = result
             self.director_mode, self.director_language = content_mode, lang
             self.script_approved = False
             self.source_playback = False
@@ -587,7 +612,7 @@ class Studio(QMainWindow):
             self.tabs.setCurrentIndex(1)
             self.show_script_panel(True)
             self.refresh()
-            self.statusBar().showMessage(f"AI draft ready · {failed} skipped or failed scenes · review evidence and script.")
+            self.statusBar().showMessage(f"AI draft ready · {failed} skipped/failed scenes · dialogue: {dialogue_status}")
 
         def failed(message):
             from .planning import record
@@ -901,6 +926,7 @@ class Studio(QMainWindow):
         stage_start = started
         stage = ""
         recent = message
+        evidence_status = {}
         estimate = None
         timer = QTimer(self)
 
@@ -913,6 +939,13 @@ class Studio(QMainWindow):
         def update_progress(text):
             nonlocal stage, stage_start, recent, estimate
             recent = text
+            if text.startswith("Visual evidence ·"):
+                evidence_status["visual"] = text
+            elif text.startswith("Dialogue evidence ·") and "of source time" in text:
+                evidence_status["dialogue"] = text
+            if evidence_status:
+                self.evidence_status.setText("   |   ".join(evidence_status.values()))
+                self.evidence_status.show()
             numbered = re.search(r"(\d+)\s*(?:/|of)\s*(\d+)", text)
             if numbered:
                 key = text[:numbered.start()].strip()
@@ -985,6 +1018,7 @@ class Studio(QMainWindow):
     def apply_movie(self, result):
         self.movie, self.source_key = result
         self.recovery_panel.hide()
+        self.evidence_status.hide()
         self.planning_resume = None
         self.planning_report = None
         self.analysis = None

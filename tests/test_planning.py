@@ -20,6 +20,11 @@ class RecoveryTests(TestCase):
         self.assertEqual(len(invalid), 5)
         self.assertEqual(planning.references("s100", {"s100"})[0], [])
 
+    def test_reject_unsupported_movie_identification_and_coordinates(self):
+        observed = planning.visual_text(["A scene from the movie The Wizard of Oz. The image shows a boy beside a blue door.",
+                                         "(30, 45), (50, 21)", "A boy named Adrian turns away."])
+        self.assertEqual(observed, "a boy beside a blue door.")
+
     def test_context_truncation_is_reported_and_raw_reply_saved(self):
         with TemporaryDirectory() as folder:
             root = Path(folder)
@@ -53,7 +58,7 @@ class RecoveryTests(TestCase):
                 stamp = f"{identity(source)}:moondream:existing-digest:{clip.start}:{clip.end}:v1"
                 (root / f"ollama-{sha256(stamp.encode()).hexdigest()}.json").write_text(json.dumps({
                     "source_in": float(clip.start), "source_out": float(clip.end),
-                    "timestamp": float(clip.start + 1), "description": "A family walks beside a wooden doorway."
+                    "timestamp": float(clip.start + 1), "description": "The image shows a family walks beside a wooden doorway. A young boy has short brown hair and a blue shirt standing in front of a wooden door."
                 }), encoding="utf-8")
             with patch.object(local_ai, "describe_image") as vision:
                 observations = batch.describe(selected, lambda _: None, cache_only=True)
@@ -65,9 +70,12 @@ class RecoveryTests(TestCase):
             stages = []
             selection_calls = 0
             interrupt = True
+            summary_calls = 0
+            repeat_options = []
+            full_evidence = "short brown hair and a blue shirt standing in front of a wooden door."
 
             def request(route, body=None, **kwargs):
-                nonlocal selection_calls
+                nonlocal selection_calls, summary_calls
                 if route == "/api/show":
                     return {"model_info": {"qwen.context_length": 2048}}
                 if route == "/api/version":
@@ -86,6 +94,15 @@ class RecoveryTests(TestCase):
                     response = {"text": "The family walks beside the wooden doorway.", "shots": selected_ids}
                 else:
                     stages.append((field, []))
+                    if field == "summary":
+                        summary_calls += 1
+                        prompt = body["messages"][1]["content"]
+                        self.assertIn(full_evidence, prompt)
+                        if summary_calls in (15, 16):
+                            repeat_options.append(body["options"])
+                            return {"done_reason": "length", "prompt_eval_count": 697, "eval_count": 640,
+                                    "message": {"content": '{"summary":"' +
+                                                "a man in a blue shirt standing in front of a door " * 58}}
                     response = {field: "A family walks beside the wooden doorway."}
                 return {"message": {"content": json.dumps(response)}, "done_reason": "stop"}
 
@@ -100,6 +117,11 @@ class RecoveryTests(TestCase):
                 first_dir = next(root.glob("planning-v312-*"))
                 first = json.loads((first_dir / "chapter-1.json").read_text())
                 self.assertTrue(first["fallback"])
+                self.assertEqual(len(repeat_options), 2)
+                self.assertGreater(repeat_options[1]["repeat_penalty"], repeat_options[0]["repeat_penalty"])
+                self.assertTrue((first_dir / "summary-15-1.json").is_file())
+                self.assertTrue((first_dir / "summary-15-2.json").is_file())
+                self.assertIn("repeated phrases", report.read_text(encoding="utf-8"))
                 self.assertTrue(all(value.startswith("s") and value != "s999999" for value in first["shots"]))
                 self.assertLess(len(stages[-2][1]), len(stages[-3][1]))
                 interrupt = False

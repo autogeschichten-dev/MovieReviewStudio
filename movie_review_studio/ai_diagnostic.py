@@ -114,7 +114,7 @@ def peak(samples):
 def diagnostic(destination, video=None):
     destination = Path(destination)
     started = monotonic()
-    log = ["Movie Review Studio V3.1.2 local AI diagnostic",
+    log = ["Movie Review Studio V3.1.3 local AI diagnostic",
            "Measurements are made on this computer. No movie or frame is sent outside loopback."]
     stop = Event()
     ram, gpu = [ram_used()], [gpu_used()]
@@ -181,7 +181,7 @@ def diagnostic(destination, video=None):
                                            os.getenv("MRS_DIAG_WHISPER_MODEL", "base"))
                 elapsed = monotonic() - begin
                 log.append(f"Dialogue: {result['provider']} · {result['language']} · {len(result['segments'])} cues · {elapsed:.2f}s")
-                if result["provider"] == "faster-whisper":
+                if result["provider"].startswith("faster-whisper"):
                     log.append(f"Transcription speed: {movie.duration / max(.001, elapsed):.2f}x source real time.")
             else:
                 log.append("Transcription not measured. Supply an authorized video with audio and configure faster-whisper.")
@@ -189,7 +189,32 @@ def diagnostic(destination, video=None):
         if text_model in models:
             text_result = test_text(text_model)
             log.append(f"Qwen text JSON / candidate-ID check · {text_model} · {text_result}")
-            ok = text_result.startswith("Text test passed")
+            summary_passed = False
+            if text_result.startswith("Text test passed"):
+                from .director import VisionProvider
+                from .planning import TextPlanner, schema_text
+                with tempfile.TemporaryDirectory(prefix="mrs-summary-test-") as temp:
+                    trace = Path(temp) / "summary.jsonl"
+                    provider = VisionProvider(local_ai.OLLAMA + "/v1/chat/completions", text_model, False)
+                    planner = TextPlanner(provider, trace)
+                    try:
+                        for attempt in range(2):
+                            try:
+                                result = planner.ask("summary-diagnostic", {
+                                    "instruction": "Summarize these two observations in one concise sentence without repeating.",
+                                    "evidence": [["s0", 1, "A red square appears against a blue background."],
+                                                 ["s8", 2, "A yellow square appears against a green background."]],
+                                }, schema_text("summary"), Path(temp), log.append, attempt=attempt)
+                                summary_passed = True
+                                log.append("Summary result: " + result["summary"])
+                                break
+                            except (RuntimeError, ValueError) as error:
+                                log.append(f"Summary attempt {attempt + 1}/2: {error}")
+                    finally:
+                        if trace.is_file():
+                            log.append("Summary request and raw response trace: " + trace.read_text(encoding="utf-8"))
+                        local_ai.release_model(text_model)
+            ok = text_result.startswith("Text test passed") and summary_passed
         else:
             log.append(f"Text endpoint check skipped · {text_model} is not installed.")
             ok = True

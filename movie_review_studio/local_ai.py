@@ -13,7 +13,7 @@ from urllib.request import ProxyHandler, Request, build_opener
 
 from .analysis import atomic_json
 from .media import identity
-from .recap_upstream import frames, transcribe
+from .recap_upstream import frames
 from .recap_upstream._common import run_cmd
 
 OLLAMA = "http://127.0.0.1:11434"
@@ -97,7 +97,7 @@ def normalize_observation(raw):
     def strings(value):
         if isinstance(value, str):
             value = [value]
-        return [str(item).strip()[:300] for item in value[:6]
+        return [str(item).strip() for item in value[:6]
                 if isinstance(item, str) and item.strip()] if isinstance(value, list) else []
 
     def acceptable(line):
@@ -120,7 +120,7 @@ def normalize_observation(raw):
                 values["uncertain"].append(sentence)
             else:
                 description.append(sentence)
-    values["description"] = " ".join(description)[:1000]
+    values["description"] = " ".join(description)
     if not values["description"] and not any(values[key] for key in FIELDS if key != "uncertain"):
         raise ObservationError("Moondream returned no usable visual description.")
     return values
@@ -256,33 +256,54 @@ def whisper_python():
     return os.getenv("MRS_WHISPER_PYTHON", "").strip()
 
 
-def dialogue(movie, cache, progress, model="base"):
+def dialogue(movie, cache, progress, model="base", *, subtitle_file=None, ocr=False, translate=False):
+    from . import dialogue as evidence
     if model not in {"base", "small"}:
         raise ValueError("Choose base or small for faster-whisper.")
     path = movie.path
-    sidecar = next((path.with_suffix(ext) for ext in (".srt", ".vtt") if path.with_suffix(ext).is_file()), None)
-    stamp = ":".join([identity(path), identity(sidecar) if sidecar else "embedded", model,
-                      whisper_python(), os.getenv("MRS_WHISPER_CACHE", "")])
-    saved = cache / f"dialogue-31-{sha256(stamp.encode()).hexdigest()}.json"
+    sidecar = Path(subtitle_file) if subtitle_file else next((path.with_suffix(ext) for ext in (".srt", ".vtt") if path.with_suffix(ext).is_file()), None)
+    legacy_stamp = ":".join([identity(path), identity(sidecar) if sidecar else "embedded", model,
+                             whisper_python(), os.getenv("MRS_WHISPER_CACHE", "")])
+    stamp = f"{legacy_stamp}:{ocr}:{translate}"
+    saved = cache / f"dialogue-313-{sha256(stamp.encode()).hexdigest()}.json"
     progress("Dialogue transcription · checking cached subtitles or transcript")
     if saved.exists():
         return json.loads(saved.read_text(encoding="utf-8"))
-    for source in (("srt", "embedded") if sidecar else ("embedded",)):
-        output = transcribe.transcribe_media(path, srt_path=sidecar, provider=source)
-        if output["status"] == "ok":
-            atomic_json(saved, output)
-            return output
+    output = evidence.subtitles(path, sidecar)
+    if not output["segments"] and ocr:
+        try:
+            output = evidence.ocr_captions(movie, progress)
+        except RuntimeError as error:
+            progress(f"Dialogue OCR unavailable · {error}")
+    if output["segments"]:
+        atomic_json(saved, output)
+        return output
+    progress("No usable subtitles found · subtitles may be burned in or absent")
+    if not (ocr or translate or subtitle_file):
+        legacy = cache / f"dialogue-31-{sha256(legacy_stamp.encode()).hexdigest()}.json"
+        if legacy.is_file():
+            try:
+                existing = json.loads(legacy.read_text(encoding="utf-8"))
+                if existing.get("segments"):
+                    progress("Dialogue evidence · reused a compatible earlier transcript")
+                    atomic_json(saved, existing)
+                    return existing
+            except (ValueError, OSError):
+                pass
     python = whisper_python()
     if not python or not movie.has_audio:
-        return {"provider": "none", "language": None, "segments": []}
+        return output
     progress(f"Dialogue transcription · faster-whisper {model} on CPU")
     worker = (Path(sys.executable).parent / "movie_review_studio" / "whisper_worker.py"
               if getattr(sys, "frozen", False) else Path(__file__).with_name("whisper_worker.py"))
     checkpoints = saved.with_suffix("")
     checkpoints.mkdir(exist_ok=True)
-    completed = run_cmd([python, str(worker), str(path), model, str(checkpoints)], check=False)
+    completed = run_cmd([python, str(worker), str(path), model, str(checkpoints), "translate" if translate else "transcribe"], check=False)
     if completed.returncode:
         raise RuntimeError("faster-whisper failed. Check MRS_WHISPER_PYTHON and the local model setup.")
     output = json.loads(completed.stdout)
-    atomic_json(saved, output)
+    if output["segments"]:
+        atomic_json(saved, output)
+    else:
+        output["provider"] = "none"
     return output
