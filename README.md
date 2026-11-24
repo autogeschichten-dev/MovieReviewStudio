@@ -73,3 +73,29 @@ Movie Review Studio validates evidence IDs against locally extracted frames and 
 - **Export timeline JSON…** exchanges timestamped picture, whole-clip audio modes and script metadata using the upstream v3 format. Import supports this app's single-source editing subset. Multi-source edits, overlays, crop directives and externally authored audio routing require the upstream tools. **Check exported video…** writes an upstream physical check report with any flags for review. Existing project versions still open; V3 stores scripts in project version 4.
 
 See [third-party notices](THIRD_PARTY_NOTICES.md).
+
+## V3.1 local AI workflow
+
+Start Ollama and keep `moondream:latest` installed. In **Import**, choose a movie and open **Analyze Movie / Generate AI Review**. The dialog lists installed Ollama models and shows connection status. Start **Analyze Movie** to cache a chronological sample of actual source frames and local dialogue cues. Then choose a separate text model and click **Generate AI Review**. Select Cultural Stories, Life Lessons, Psychological Analysis, or Custom Script. Model observations may be mistaken. Review visible evidence and uncertainty before approving the script. **Fast Montage** requires neither model.
+
+The visual stage sends one JPEG at a time to `http://127.0.0.1:11434/api/generate`, with a 2,048-token context and an indexed, timestamped cache. Moondream is unloaded before the planner runs. A local planner on the same Ollama service is unloaded before vision and after planning. Choose an installed text model that fits your machine and can follow JSON instructions. Select it in the dialog or set `MRS_TEXT_MODEL`. The default text API is `http://127.0.0.1:11434/v1`. An optional compatible remote planner uses `MRS_TEXT_URL` and `MRS_TEXT_KEY`, and needs confirmation before sending descriptions, dialogue excerpts or custom script text. Movie frames stay on the machine. The V3 vision variables above describe the legacy provider interface.
+
+For an RTX 3050 with 4 GB VRAM, run vision, transcription and planning sequentially. The initial visual pass can sample up to 640 stills, so measure seconds per image before a full run. A small text model with a larger supported context may require CPU offload or a separately configured planner. Timestamps and uncertainty are preserved, but relevance and factual accuracy still require review. Completed scenes, transcript chunks, and planner responses are cached. A cancelled request may need to finish before the app can unload the model.
+
+### Local faster-whisper on Windows
+
+Subtitles take priority. To enable local speech recognition, use a separate Python 3.12 environment with faster-whisper installed. The app uses CPU INT8, six CPU threads, automatic language detection and five-minute checkpoints. Models are pre-downloaded by the user. The app opens them locally only. Example in PowerShell:
+
+```powershell
+py -3.12 -m venv .whisper-venv
+.\.whisper-venv\Scripts\python.exe -m pip install faster-whisper
+.\.whisper-venv\Scripts\python.exe -c "from faster_whisper import WhisperModel; WhisperModel('base', device='cpu', compute_type='int8')"
+$env:MRS_WHISPER_PYTHON = (Resolve-Path .\.whisper-venv\Scripts\python.exe).Path
+.\RUN_WINDOWS.bat
+```
+
+Repeat the pre-download with `small` if you select that model. `MRS_WHISPER_CACHE` optionally points at the Hugging Face download cache. There is no automatic model download during editing.
+
+### Measure this PC
+
+Double-click `RUN_AI_DIAGNOSTIC.bat` in the portable ZIP for a four-second red-and-blue fixture. The report includes the actual images' byte counts and hashes, raw observations, known-color checks, response time, Ollama VRAM, sampled NVIDIA memory and system RAM, and total elapsed time. Then drag an authorized short video with audio onto the batch file. Repeat with full-length authorized footage. The default is 12 sampled stills per supplied movie, configurable with `MRS_DIAG_SAMPLES` up to 640. The optional video also checks subtitle or transcript timing and reports faster-whisper throughput when configured. Inspect scene descriptions for false details. The synthetic color check measures only recognition of two colors. The report opens in Notepad from `%TEMP%\MovieReviewStudio-AI-Diagnostic.txt`.

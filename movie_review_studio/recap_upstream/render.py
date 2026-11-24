@@ -381,7 +381,7 @@ def render_timeline(
                 run_cmd(["ffmpeg", "-y", "-hide_banner", *inputs, *f_args, "-map", "[aout]", *range_args, "-ar", "48000", "-ac", "2", str(out)], check=True)
                 return {"output": str(out), "audio_only": True, "duration_s": total_dur, "loudness_plan": ln_plan, "warnings": pre["warnings"]}
             enc = ["-c:v", "libx264", "-preset", "ultrafast" if preview else "medium",
-                   "-crf", "28" if preview else "18", "-pix_fmt", "yuv420p", *color_tag_args(_BT709)]
+                   "-crf", "28" if preview else "18", "-r", fps_str, "-fps_mode", "cfr", "-pix_fmt", "yuv420p", *color_tag_args(_BT709)]
             dur_args = [] if time_range else ["-t", f"{total_dur:.4f}"]
             run_cmd([
                 "ffmpeg", "-y", "-hide_banner", *inputs, *f_args, "-map", cur_v, "-map", "[aout]", *range_args,

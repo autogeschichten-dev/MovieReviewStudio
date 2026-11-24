@@ -1,3 +1,5 @@
 packaging/RUN_WINDOWS.bat text eol=crlf
 
 RUN_WINDOWS.bat text eol=crlf
+
+RUN_AI_DIAGNOSTIC.bat text eol=crlf

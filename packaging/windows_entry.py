@@ -6,6 +6,7 @@ from PySide6.QtCore import QTimer
 from PySide6.QtWidgets import QApplication
 
 from movie_review_studio.app import Studio, main
+from movie_review_studio.ai_diagnostic import diagnostic
 
 
 def smoke_startup(marker: Path) -> int:
@@ -32,6 +33,8 @@ def smoke_startup(marker: Path) -> int:
 
 
 if __name__ == "__main__":
+    if len(sys.argv) in (3, 4) and sys.argv[1] == "--ai-diagnostic":
+        raise SystemExit(diagnostic(*sys.argv[2:]))
     if len(sys.argv) == 3 and sys.argv[1] == "--startup-smoke-test":
         marker_path = Path(sys.argv[2]).resolve()
         del sys.argv[1:]

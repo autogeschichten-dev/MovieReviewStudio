@@ -3,12 +3,14 @@ from dataclasses import replace
 from pathlib import Path
 from threading import Event
 import os
+import re
+from time import monotonic
 import json
 import logging
 import math
 import sys
 
-from PySide6.QtCore import QObject, QRunnable, QSize, QStandardPaths, QThreadPool, Qt, QUrl, Signal
+from PySide6.QtCore import QObject, QRunnable, QSize, QStandardPaths, QThreadPool, QTimer, Qt, QUrl, Signal
 from PySide6.QtGui import QKeySequence, QPixmap, QShortcut, QValidator
 from PySide6.QtMultimedia import QAudioOutput, QMediaPlayer
 from PySide6.QtMultimediaWidgets import QVideoWidget
@@ -21,7 +23,7 @@ from PySide6.QtWidgets import (
 
 from .analysis import analyze, atomic_json, fingerprint_highlight
 from .media import Cancelled, cancellation, identity, inspect, invoke
-from . import director
+from . import director, local_ai
 from .editor import SceneModel, Timeline, TrackLabels, thumbnail
 from .model import adjacent_conflict, overlaps, replacement, timeline_entries, validate
 from .render import Mix, render, render_selection
@@ -234,7 +236,7 @@ class Studio(QMainWindow):
                 row.addWidget(self.button("Clear", clear))
             row.addWidget(label, 1)
             form.addRow(name, row)
-        self.analyze_button = self.button("Auto Generate Movie Review", self.generate)
+        self.analyze_button = self.button("Fast Montage", self.generate)
         self.analyze_button.setObjectName("primary")
         self.import_target = TargetDuration()
         self.import_target.setRange(1020, 1080)
@@ -242,6 +244,7 @@ class Studio(QMainWindow):
         self.import_target.setSingleStep(5)
         form.addRow("Target duration", self.import_target)
         form.addRow(self.analyze_button)
+        form.addRow(self.button("Analyze Movie / Generate AI Review…", self.open_director))
         self.analysis_label = QLabel()
         self.analysis_label.setWordWrap(True)
         form.addRow("Analysis", self.analysis_label)
@@ -354,8 +357,9 @@ class Studio(QMainWindow):
         from PySide6.QtWidgets import QCheckBox, QDialog, QDialogButtonBox
         self.require_movie()
         dialog = QDialog(self)
-        dialog.setWindowTitle("Generate AI Review")
-        dialog.resize(520, 420)
+        dialog.setWindowTitle("Analyze Movie / Generate AI Review")
+        dialog.resize(540, 535)
+        action = "generate"
         form = QFormLayout(dialog)
         mode = QComboBox()
         mode.addItems(director.MODES)
@@ -368,6 +372,32 @@ class Studio(QMainWindow):
         highlights_enabled = QCheckBox("Include suggested original-audio highlights")
         highlights_enabled.setChecked(True)
         form.addRow(highlights_enabled)
+        connection = QLabel("Checking Ollama at 127.0.0.1:11434…")
+        form.addRow("Ollama", connection)
+        visual = QComboBox()
+        visual.addItem(local_ai.DEFAULT_MODEL)
+        form.addRow("Visual model", visual)
+        reasoning = QComboBox()
+        reasoning.setEditable(True)
+        reasoning.setCurrentText(os.getenv("MRS_TEXT_MODEL", ""))
+        form.addRow("Text reasoning model", reasoning)
+        whisper = QComboBox()
+        whisper.addItems(["base", "small"])
+        form.addRow("Speech model (CPU)", whisper)
+        def list_models(result):
+            version, installed = result
+            connection.setText(f"Connected · {version} · {len(installed)} models")
+            previous = reasoning.currentText()
+            visual.clear()
+            visual.addItems([name for name in installed if "moondream" in name.lower()] or [local_ai.DEFAULT_MODEL])
+            reasoning.clear()
+            reasoning.addItem("")
+            reasoning.addItems([name for name in installed if "moondream" not in name.lower()])
+            reasoning.setCurrentText(previous)
+        discovery = Job(lambda _: local_ai.discover())
+        discovery.signals.result.connect(lambda result: list_models(result) if dialog.isVisible() else None)
+        discovery.signals.error.connect(lambda _: connection.setText("Unavailable · start Ollama locally") if dialog.isVisible() else None)
+        QTimer.singleShot(0, lambda: QThreadPool.globalInstance().start(discovery))
         code = QPlainTextEdit()
         code.setPlaceholderText("Paste original commentary for Custom Script")
         form.addRow(code)
@@ -382,22 +412,29 @@ class Studio(QMainWindow):
                     self.error(str(error))
 
         form.addRow(self.button("Import TXT…", load_text))
-        disclosure = QLabel("Fast Montage runs offline. AI Director uses a configured vision endpoint. "
-                            "Cloud mode sends sampled stills, local transcript excerpts and any custom script. "
-                            "Provider charges may apply. Cost is unavailable unless supplied by your provider.")
+        disclosure = QLabel("Analyze Movie uses local Moondream and local subtitles or faster-whisper. "
+                            "Generate AI Review uses a separate text model. A configured cloud planner "
+                            "receives descriptions and transcript excerpts only, with your approval.")
         disclosure.setWordWrap(True)
         form.addRow(disclosure)
         box = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
         box.button(QDialogButtonBox.StandardButton.Ok).setText("Generate AI Review")
+        analyze_only = box.addButton("Analyze Movie", QDialogButtonBox.ButtonRole.ActionRole)
+        def start_analysis():
+            nonlocal action
+            action = "analyze"
+            dialog.accept()
+        analyze_only.clicked.connect(start_analysis)
         box.accepted.connect(dialog.accept)
         box.rejected.connect(dialog.reject)
         form.addRow(box)
         if dialog.exec() != QDialog.DialogCode.Accepted:
             return
-        provider = director.VisionProvider.from_environment()
-        if provider.cloud:
+        provider = director.VisionProvider.from_environment(reasoning.currentText(), text_only=True) if action == "generate" else None
+        visual_model, speech_model = visual.currentText(), whisper.currentText()
+        if provider and provider.cloud:
             consent = QMessageBox.question(self, "Allow cloud processing?",
-                f"Send selected movie stills, transcript excerpts and script text to {provider.url}? "
+                f"Send scene descriptions, transcript excerpts and script text to {provider.url}? "
                 "Your provider may charge for this request.")
             if consent != QMessageBox.StandardButton.Yes:
                 return
@@ -406,15 +443,48 @@ class Studio(QMainWindow):
         include_highlights = highlights_enabled.isChecked()
 
         def work(progress):
+            progress("Scene detection · checking movie analysis")
             analysis = self.analysis or analyze(self.movie, self.cache, progress)
-            audio = self.read_movie_evidence(progress)
+            _, models = local_ai.discover()
+            if visual_model not in models or "moondream" not in visual_model.lower():
+                raise ValueError(f"Install {visual_model} in Ollama before running visual analysis.")
+            transcript = local_ai.dialogue(self.movie, self.cache, progress, speech_model)
+            audio = (audio_evidence(self.movie.path, self.cache, progress, movie=True)
+                     if self.movie.has_audio else AudioEvidence())
+            cues = transcript["segments"]
+            if cues:
+                audio = replace(audio, captions=tuple((float(c["start"]), float(c["end"])) for c in cues))
             highlights = (self.highlights or suggest_highlights(self.movie, analysis, audio, self.cache, progress)
                           ) if include_highlights else []
-            clips, script = director.plan(self.movie, analysis, highlights, provider, content_mode, lang,
-                                          target, text, self.cache, progress)
+            local_planner = provider and provider.url == local_ai.OLLAMA + "/v1/chat/completions"
+            if local_planner:
+                local_ai.release_model(provider.model)
+            vision = local_ai.VisionBatch(self.movie, analysis, self.cache, visual_model, models[visual_model])
+            def observations(clips, report):
+                try:
+                    return vision.describe(clips, report)
+                finally:
+                    vision.unload()
+            if action == "analyze":
+                candidates = [clip for clip in analysis.candidates if not clip.production_card]
+                selected = [clip for group in director.chapters(candidates, 16) for clip in director.sample_group(group)]
+                count = len(observations(selected, progress))
+                return analysis, audio, count, transcript["provider"]
+            try:
+                clips, script = director.plan(self.movie, analysis, highlights, provider, content_mode, lang,
+                                              target, text, self.cache, progress, observations=observations,
+                                              transcript=cues)
+            finally:
+                if local_planner:
+                    local_ai.release_model(provider.model)
             return analysis, audio, highlights, clips, script
 
         def apply(result):
+            if action == "analyze":
+                self.analysis, self.waves["original"], count, transcript_source = result
+                self.refresh()
+                self.statusBar().showMessage(f"Analysis cached · {count} scenes · dialogue source: {transcript_source}")
+                return
             self.record_edit()
             self.drop_generated_voice()
             self.analysis, self.waves["original"], self.highlights, self.clips, self.script = result
@@ -427,7 +497,7 @@ class Studio(QMainWindow):
             self.refresh()
             self.statusBar().showMessage("AI draft ready for source and script review.")
 
-        self.background("Preparing grounded AI review…", work, apply)
+        self.background("Preparing local analysis…" if action == "analyze" else "Preparing grounded AI review…", work, apply)
 
     def refresh_script(self, selected=None):
         current = self.script_picker.currentIndex()
@@ -717,9 +787,40 @@ class Studio(QMainWindow):
         self.cancel_button.setEnabled(True)
         self.statusBar().showMessage(message)
         self.job = Job(operation)
-        self.job.signals.progress.connect(self.statusBar().showMessage)
+        started = monotonic()
+        stage_start = started
+        stage = ""
+        recent = message
+        estimate = None
+        timer = QTimer(self)
+
+        def show_time():
+            elapsed = clock(monotonic() - started).split(".")[0]
+            left = "ETA estimating" if estimate is None else "ETA " + clock(max(0, estimate - monotonic())).split(".")[0]
+            if self.cancel_button.isEnabled():
+                self.statusBar().showMessage(f"{recent}  ·  {elapsed} elapsed  ·  {left}")
+
+        def update_progress(text):
+            nonlocal stage, stage_start, recent, estimate
+            recent = text
+            numbered = re.search(r"(\d+)\s*(?:/|of)\s*(\d+)", text)
+            if numbered:
+                key = text[:numbered.start()].strip()
+                if key != stage:
+                    stage, stage_start = key, monotonic()
+                done, total = map(int, numbered.groups())
+                if done > 1:
+                    estimate = monotonic() + (monotonic() - stage_start) * (total - done) / (done - 1)
+            elif not text.startswith("Waiting for"):
+                stage, estimate = "", None
+            show_time()
+        self.job.signals.progress.connect(update_progress)
+        timer.timeout.connect(show_time)
+        timer.start(1000)
 
         def finish():
+            timer.stop()
+            timer.deleteLater()
             self.tabs.setEnabled(True)
             self.progress.hide()
             self.cancel_button.hide()
