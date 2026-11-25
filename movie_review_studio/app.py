@@ -468,6 +468,11 @@ class Studio(QMainWindow):
         ocr = QCheckBox("Try local OCR for burned-in English subtitles")
         translate = QCheckBox("Translate recognized speech into English")
         form.addRow(ocr)
+        speech = QCheckBox("Transcribe movie audio when subtitles are unavailable")
+        speech.setEnabled(bool(local_ai.whisper_python()))
+        speech.setChecked(speech.isEnabled())
+        speech.setToolTip("Requires the optional local faster-whisper setup described in README.")
+        form.addRow(speech)
         form.addRow(translate)
         def list_models(result):
             version, installed = result
@@ -540,6 +545,7 @@ class Studio(QMainWindow):
         include_highlights = highlights_enabled.isChecked()
         chosen_subtitles = subtitle_path.text().strip() or None
         use_ocr, use_translation = ocr.isChecked(), translate.isChecked()
+        use_speech = speech.isChecked()
 
         source_key = self.source_key
         report_path = self.cache / f"ai-planning-{source_key}.txt"
@@ -551,10 +557,13 @@ class Studio(QMainWindow):
             if visual_model not in models or "moondream" not in visual_model.lower():
                 raise ValueError(f"Install {visual_model} in Ollama before running visual analysis.")
             transcript = local_ai.dialogue(self.movie, self.cache, progress, speech_model,
-                                           subtitle_file=chosen_subtitles, ocr=use_ocr, translate=use_translation)
-            from .dialogue import coverage
+                                           subtitle_file=chosen_subtitles, ocr=use_ocr, translate=use_translation,
+                                           transcribe=use_speech)
+            from .dialogue import coverage, missing_dialogue
             dialogue_status = (f"{transcript['provider']} · {len(transcript['segments'])} cues · "
                                f"{coverage(transcript['segments'], self.movie.duration):.1f}% of source time")
+            if not transcript["segments"]:
+                dialogue_status += f" · {missing_dialogue(transcript)}"
             progress(f"Dialogue evidence · {dialogue_status}")
             audio = (audio_evidence(self.movie.path, self.cache, progress, movie=True)
                      if self.movie.has_audio else AudioEvidence())
@@ -567,16 +576,26 @@ class Studio(QMainWindow):
             if local_planner:
                 local_ai.release_model(provider.model)
             vision = local_ai.VisionBatch(self.movie, analysis, self.cache, visual_model, models[visual_model])
-            def observations(clips, report):
+            failed_observations = 0
+
+            def observations(clips, report, *, cache_only=None):
+                nonlocal failed_observations
+                read_only = only_cached or bool(cache_only)
+                if cache_only is False and local_planner and not read_only:
+                    local_ai.release_model(provider.model)
                 try:
-                    result = vision.describe(clips, report, observe=report, cache_only=only_cached)
+                    result = vision.describe(clips, report, observe=report, cache_only=read_only,
+                                             allow_empty=cache_only is not None or action != "analyze")
                 except Exception:
                     try:
                         vision.unload()
                     except RuntimeError:
                         logging.warning("Could not unload the vision model after failure.")
                     raise
-                vision.unload()
+                if cache_only is not True:
+                    vision.unload()
+                if cache_only is None or not read_only:
+                    failed_observations += vision.failed
                 return result
             if action == "analyze":
                 candidates = [clip for clip in analysis.candidates if not clip.production_card]
@@ -586,7 +605,8 @@ class Studio(QMainWindow):
             try:
                 clips, script = director.plan(self.movie, analysis, highlights, provider, content_mode, lang,
                                               target, text, self.cache, progress, observations=observations,
-                                              transcript=cues, report=report_path, min_gap=min_gap)
+                                              transcript=cues, report=report_path, min_gap=min_gap,
+                                              expand_live=not only_cached)
             except Exception:
                 if local_planner:
                     try:
@@ -596,7 +616,7 @@ class Studio(QMainWindow):
                 raise
             if local_planner:
                 local_ai.release_model(provider.model)
-            return analysis, audio, highlights, clips, script, vision.failed, dialogue_status
+            return analysis, audio, highlights, clips, script, failed_observations, dialogue_status
 
         def apply(result):
             if action == "analyze":
@@ -955,6 +975,8 @@ class Studio(QMainWindow):
                 evidence_status["visual"] = text
             elif text.startswith("Dialogue evidence ·") and "of source time" in text:
                 evidence_status["dialogue"] = text
+            elif text.startswith("Duration recovery ·") and "eligible" in text:
+                evidence_status["duration"] = text
             if evidence_status:
                 self.evidence_status.setText("   |   ".join(evidence_status.values()))
                 self.evidence_status.show()

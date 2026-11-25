@@ -229,7 +229,7 @@ def sample_group(group):
 
 
 def plan(movie, analysis, highlights, provider, mode, language, target, custom, cache, progress,
-         *, observations=None, transcript=None, report=None, min_gap=DEFAULT_SOURCE_GAP):
+         *, observations=None, transcript=None, report=None, min_gap=DEFAULT_SOURCE_GAP, expand_live=True):
     progress("Probing source with Video Recap Skills…")
     metadata = probe.probe_sources([movie.path])
     if not metadata["sources"][0].get("has_video"):
@@ -240,7 +240,7 @@ def plan(movie, analysis, highlights, provider, mode, language, target, custom, 
                   not any(overlaps(c, h) for h in highlights)]
     goal = min(int(1080 * movie.fps), round(target * movie.fps))
     remaining = goal - sum(c.frames for c in highlights)
-    if sum(c.frames for c in candidates) < remaining:
+    if observations is None and sum(c.frames for c in candidates) < remaining:
         raise ValueError("The source has insufficient usable footage for the requested review duration.")
     custom_parts = [part.strip() for part in re.split(r"\n\s*\n", custom) if part.strip()]
     if mode == "Custom Script" and not custom_parts:
@@ -255,7 +255,8 @@ def plan(movie, analysis, highlights, provider, mode, language, target, custom, 
     groups = chapters(candidates, group_count)
     if mode == "Custom Script" and len(groups) < len(custom_parts):
         raise ValueError("The source has too few distinct chapters for this script.")
-    if callable(observations):
+    expand = observations if callable(observations) else None
+    if expand:
         # Match the standalone V3.1.1 Analyze Movie sampling and unchanged observation keys.
         visual = [c for c in analysis.candidates if not c.production_card]
         observations = observations([c for group in chapters(visual, 16) for c in sample_group(group)], progress)
@@ -263,7 +264,7 @@ def plan(movie, analysis, highlights, provider, mode, language, target, custom, 
         from .planning import plan as plan_grounded
         return plan_grounded(movie, analysis, highlights, provider, mode, language, target, custom, cache,
                              progress, candidates, observations, transcript,
-                             custom_parts if mode == "Custom Script" else [], report, min_gap=min_gap)
+                             custom_parts if mode == "Custom Script" else [], report, min_gap=min_gap, expand=expand, expand_live=expand_live)
     all_clips = sorted(highlights, key=lambda c: c.start)
     frame_dir = cache / f"recap-frames-{identity(movie.path)}"
     frame_dir.mkdir(exist_ok=True)

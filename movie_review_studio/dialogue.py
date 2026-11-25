@@ -56,6 +56,14 @@ def subtitles(path, sidecar):
     return {"provider": "none", "language": None, "segments": [], "subtitle_streams": len(streams)}
 
 
+def missing_dialogue(output):
+    if output.get("subtitle_streams"):
+        return ("Embedded subtitle tracks found, but none yielded text cues. "
+                "Supply an SRT/VTT or enable local speech transcription.")
+    return ("No embedded subtitle tracks found. Burned-in subtitles, if present, are part of the picture. "
+            "Enable subtitle OCR or local speech transcription, or supply an SRT/VTT.")
+
+
 def ocr_captions(movie, progress):
     executable = shutil.which("tesseract")
     if not executable:

@@ -166,7 +166,7 @@ class VisionBatch:
         self.source_key = identity(movie.path)
         self.loaded = False
 
-    def describe(self, clips, progress, observe=None, *, cache_only=False):
+    def describe(self, clips, progress, observe=None, *, cache_only=False, allow_empty=False):
         result = {}
         failure = ""
         provider_failures = 0
@@ -236,9 +236,9 @@ class VisionBatch:
                 break
         if cache_only:
             progress(f"Cache reuse · {len(result)}/{self.total} visual observations · no inference")
-            if not result:
+            if not result and not allow_empty:
                 raise ObservationError("No compatible cached observations. Use Resume AI Review to analyze missing scenes.")
-        if not result:
+        if not result and not allow_empty:
             raise ObservationError(f"No visual evidence after {self.failed} skipped or failed scenes. "
                                    f"Last issue: {failure or 'no usable source frames'}. "
                                    "Run Test Vision AI or the Windows diagnostic, then retry.")
@@ -256,7 +256,7 @@ def whisper_python():
     return os.getenv("MRS_WHISPER_PYTHON", "").strip()
 
 
-def dialogue(movie, cache, progress, model="base", *, subtitle_file=None, ocr=False, translate=False):
+def dialogue(movie, cache, progress, model="base", *, subtitle_file=None, ocr=False, translate=False, transcribe=True):
     from . import dialogue as evidence
     if model not in {"base", "small"}:
         raise ValueError("Choose base or small for faster-whisper.")
@@ -272,13 +272,16 @@ def dialogue(movie, cache, progress, model="base", *, subtitle_file=None, ocr=Fa
     output = evidence.subtitles(path, sidecar)
     if not output["segments"] and ocr:
         try:
-            output = evidence.ocr_captions(movie, progress)
+            ocr_output = evidence.ocr_captions(movie, progress)
+            if ocr_output["segments"]:
+                output = ocr_output
         except RuntimeError as error:
             progress(f"Dialogue OCR unavailable · {error}")
     if output["segments"]:
         atomic_json(saved, output)
         return output
-    progress("No usable subtitles found · subtitles may be burned in or absent")
+    from .dialogue import missing_dialogue
+    progress(missing_dialogue(output))
     if not (ocr or translate or subtitle_file):
         legacy = cache / f"dialogue-31-{sha256(legacy_stamp.encode()).hexdigest()}.json"
         if legacy.is_file():
@@ -291,7 +294,7 @@ def dialogue(movie, cache, progress, model="base", *, subtitle_file=None, ocr=Fa
             except (ValueError, OSError):
                 pass
     python = whisper_python()
-    if not python or not movie.has_audio:
+    if not transcribe or not python or not movie.has_audio:
         return output
     progress(f"Dialogue transcription · faster-whisper {model} on CPU")
     worker = (Path(sys.executable).parent / "movie_review_studio" / "whisper_worker.py"
@@ -301,9 +304,10 @@ def dialogue(movie, cache, progress, model="base", *, subtitle_file=None, ocr=Fa
     completed = run_cmd([python, str(worker), str(path), model, str(checkpoints), "translate" if translate else "transcribe"], check=False)
     if completed.returncode:
         raise RuntimeError("faster-whisper failed. Check MRS_WHISPER_PYTHON and the local model setup.")
+    subtitle_result = output
     output = json.loads(completed.stdout)
     if output["segments"]:
         atomic_json(saved, output)
     else:
-        output["provider"] = "none"
+        output = subtitle_result
     return output

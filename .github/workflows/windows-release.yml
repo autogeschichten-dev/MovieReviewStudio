@@ -131,6 +131,9 @@ jobs:
           if (!(Test-Path (Join-Path $app RUN_WINDOWS.bat))) {
             throw 'The ZIP is missing RUN_WINDOWS.bat.'
           }
+          if ($env:RELEASE_TAG -like 'stage3-*' -and !(Test-Path (Join-Path $app RUN_AI_DIAGNOSTIC.bat))) {
+            throw 'The ZIP is missing RUN_AI_DIAGNOSTIC.bat.'
+          }
           $exe = Join-Path $app MovieReviewStudio.exe
           $process = Start-Process -FilePath $exe -WorkingDirectory $env:RUNNER_TEMP `
             -ArgumentList @('--startup-smoke-test', ('"{0}"' -f $marker)) -PassThru
@@ -167,6 +170,8 @@ jobs:
           title="Movie Review Studio for Windows x64 ($RELEASE_TAG)"
           if [[ "$RELEASE_TAG" == "stage3-windows-v3.1.4" ]]; then
             title="Movie Review Studio V3.1.4 — Anti-Adjacent Protection Update"
+          elif [[ "$RELEASE_TAG" == "stage3-windows-v3.1.5" ]]; then
+            title="Movie Review Studio V3.1.5 — AI Planning Duration Recovery"
           fi
           gh release create "$RELEASE_TAG" "$ZIP_NAME" \
             --repo "$GITHUB_REPOSITORY" --verify-tag \

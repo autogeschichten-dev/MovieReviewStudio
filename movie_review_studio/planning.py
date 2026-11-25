@@ -1,4 +1,5 @@
 """Bounded, resumable text planning over the existing frame-indexed evidence."""
+from bisect import bisect_right
 from dataclasses import dataclass
 from hashlib import sha256
 import json
@@ -200,19 +201,85 @@ class TextPlanner:
 
 def tokens(text):
     stop = {"this", "that", "with", "from", "the", "and", "film", "scene", "shows", "there",
-            "their", "about", "into", "what", "when", "then", "they", "have"}
+            "their", "about", "into", "what", "when", "then", "they", "have", "image", "picture",
+            "standing", "sitting", "looking", "person", "people", "visible", "appears"}
     return {word for word in re.findall(r"[^\W\d_]{3,}", text.casefold()) if word not in stop}
 
 
+def longest_route(shots, highlights, fps, min_gap):
+    """Find the longest chronological route through optional shots and mandatory highlights."""
+    # Endings are ranked by duration. Keep back-pointers rather than copying paths.
+    endings = [(0, None, None)]
+    events = [(shot.clip, sid) for sid, shot in shots.items()] + [(clip, None) for clip in highlights]
+    for clip, shot_id in sorted(events, key=lambda entry: entry[0].start):
+        for previous in endings:
+            duration, prior_clip, _ = previous
+            if prior_clip is not None and (clip.start <= prior_clip.end or
+                    clip.start - prior_clip.end < min_gap * fps or adjacent_conflict(prior_clip, clip, fps, min_gap)):
+                continue
+            entry = (duration + clip.frames, clip, (shot_id, previous))
+            if shot_id is None:
+                endings = [entry]
+            else:
+                index = bisect_right(endings, -entry[0], key=lambda row: -row[0])
+                endings.insert(index, entry)
+            break
+        else:
+            if shot_id is None:
+                return ()
+    route = []
+    _, clip, link = endings[0]
+    while link is not None:
+        sid, previous = link
+        route.append((clip, sid))
+        _, clip, link = previous
+    return list(reversed(route))
+
+
+def fit_route(route, chapters, budgets, model_ids, fps, min_gap, goal, minimum):
+    """Reduce overfilled chapters first, preserving chronology and valid cuts."""
+    used = [0] * len(budgets)
+    total = sum(clip.frames for clip, _ in route)
+    for clip, sid in route:
+        if sid is not None:
+            used[chapters[sid]] += clip.frames
+    route = list(route)
+    protected = {}
+    while total > goal:
+        best = None
+        for i, (clip, sid) in enumerate(route):
+            after = total - clip.frames
+            if sid is None or after < minimum:
+                continue
+            if total <= int(1080 * fps) and abs(after - goal) > total - goal:
+                continue
+            if 0 < i < len(route) - 1:
+                left, right = route[i - 1][0], route[i + 1][0]
+                key = (left.start, right.start)
+                if key not in protected:
+                    protected[key] = adjacent_conflict(left, right, fps, min_gap)
+                if protected[key]:
+                    continue
+            chapter = chapters[sid]
+            score = (total - clip.frames >= goal, used[chapter] - budgets[chapter],
+                     sid not in model_ids, clip.frames)
+            if best is None or score > best[0]:
+                best = score, i
+        if best is None:
+            break
+        clip, sid = route.pop(best[1])
+        used[chapters[sid]] -= clip.frames
+        total -= clip.frames
+    return route
+
+
 def plan(movie, analysis, highlights, provider, mode, language, target, custom, cache, progress,
-         clips, observations, transcript, custom_parts, report=None, *, min_gap=DEFAULT_SOURCE_GAP):
+         clips, observations, transcript, custom_parts, report=None, *, min_gap=DEFAULT_SOURCE_GAP, expand=None, expand_live=True):
     from .director import ScriptSection, timeline_document
 
     shots = registry(clips, observations, movie, analysis.frames)
     goal = min(int(1080 * movie.fps), round(target * movie.fps))
     remaining = goal - sum(clip.frames for clip in highlights)
-    if sum(shot.clip.frames for shot in shots.values()) < remaining - 5 * movie.fps:
-        raise ValueError("Cached visual evidence cannot cover the target. Resume AI Review to analyze missing scenes.")
     report = report or cache / "ai-planning-diagnostic.jsonl"
     planner = TextPlanner(provider, report)
     stamp = [VERSION, planner.model_version, planner.context, getattr(provider, "url", ""), mode, language,
@@ -225,6 +292,12 @@ def plan(movie, analysis, highlights, provider, mode, language, target, custom, 
     directory.mkdir(exist_ok=True)
     per_group = max(3, min(24, (planner.context - 800) // 155))
     ordered = list(shots.values())
+    if not ordered and expand:
+        shots = registry(clips, expand(clips, progress, cache_only=not expand_live), movie, analysis.frames)
+        ordered = list(shots.values())
+        expand = None
+    if not ordered:
+        raise ValueError("Maximum achievable duration: 0.000 s of grounded footage. No valid visual observations were available. Use Resume AI Review to check additional scenes.")
     count = math.ceil(len(ordered) / per_group)
     groups = [ordered[i * len(ordered) // count:(i + 1) * len(ordered) // count] for i in range(count)]
     bounded = []
@@ -316,13 +389,25 @@ def plan(movie, analysis, highlights, provider, mode, language, target, custom, 
                                      {"mode": mode, "parts": outline_parts[index:index + 6]}, limit=130)
                          for index in range(0, len(outline_parts), 6)]
     outline = cached_text("global-outline", "outline", {"mode": mode, "parts": outline_parts}, limit=300)
-    picked = list(highlights)
+    picked = sorted(highlights, key=lambda clip: clip.start)
+    if picked:
+        # Individual highlights must be valid; other clips can bridge their cuts.
+        for highlight in picked:
+            validate([highlight], movie.fps, analysis.frames, has_audio=movie.has_audio, min_gap=min_gap)
+    minimum = max(math.ceil(1020 * movie.fps), goal - int(5 * movie.fps))
+    hard_limit = int(1080 * movie.fps)
+    chapter_rows = []
+    total_weight = sum(shot.clip.frames for shot in ordered)
+    picture_budget = max(0, remaining)
+    assigned_weight = 0
     sections = []
     for offset, group in enumerate(groups):
         index = offset + 1
         progress(f"Narrative planning · {index}/{len(groups)}")
-        desired = max(1, round(remaining * sum(s.clip.frames for s in group) /
-                              sum(s.clip.frames for items in groups[offset:] for s in items)))
+        previous_budget = round(picture_budget * assigned_weight / total_weight)
+        assigned_weight += sum(s.clip.frames for s in group)
+        budget = round(picture_budget * assigned_weight / total_weight) - previous_budget
+        desired = max(1, budget)
         section_number = offset * len(custom_parts) // len(groups) if custom_parts else offset
         custom_text = custom_parts[section_number] if custom_parts else ""
         candidates = {s.id: s for s in group}
@@ -334,9 +419,12 @@ def plan(movie, analysis, highlights, provider, mode, language, target, custom, 
         text = custom_text or row.get("text")
         def frames_for(ids):
             return sum(candidates[sid].clip.frames for sid in ids)
-        history = []
-        if not valid or invalid or not isinstance(text, str) or not text.strip():
-            valid, text = [], custom_text
+        history = list(invalid)
+        prior_fallback, _ = references(row.get("fallback"), candidates)
+        prior_fallback = set(prior_fallback)
+        if (not valid and not row.get("narration_complete")) or invalid or not isinstance(text, str) or not text.strip():
+            if invalid or not isinstance(text, str):
+                text = custom_text
             for attempt in range(2):
                 shortlist = [sid for sid in candidates if sid not in valid]
                 if attempt:
@@ -369,13 +457,16 @@ def plan(movie, analysis, highlights, provider, mode, language, target, custom, 
 
         if not isinstance(text, str) or not text.strip():
             raise ValueError(f"Chapter {index} produced no grounded narration. Retry planning and inspect the diagnostic report.")
-        # Fallback never invents a range. A candidate must share a substantive term with this narration.
-        fallback = [sid for sid, shot in candidates.items() if sid not in valid and tokens(shot.text) & tokens(text)]
+        narration_terms = tokens(text)
+        model_ids = set(valid) - prior_fallback
+        fallback = [sid for sid, shot in candidates.items()
+                    if sid not in model_ids and tokens(shot.text) & narration_terms]
+        eligible = {sid: candidates[sid] for sid in dict.fromkeys([*valid, *fallback])}
         usable = []
         frames = 0
-        for sid in (*valid, *fallback):
-            clip = candidates[sid].clip
-            if frames >= desired or frames + clip.frames > remaining + min(int(5 * movie.fps), int(1080 * movie.fps) - goal):
+        for sid, shot in eligible.items():
+            clip = shot.clip
+            if frames >= desired or frames + clip.frames > remaining:
                 continue
             neighbors = sorted([*picked, clip], key=lambda item: item.start)
             at = neighbors.index(clip)
@@ -385,29 +476,105 @@ def plan(movie, analysis, highlights, provider, mode, language, target, custom, 
             usable.append(sid)
             frames += clip.frames
             picked = neighbors
-        if not usable:
-            raise ValueError(f"Chapter {index} has no usable related footage after recovery. Inspect its diagnostic entries.")
-        used_fallback = [sid for sid in usable if sid not in valid]
+        used_fallback = [sid for sid in usable if sid not in model_ids]
         record(report, chapter=index, selected=usable, fallback=used_fallback, invalid=history)
-        if used_fallback:
-            progress(f"Timeline generation · {index}/{len(groups)} · {len(used_fallback)} evidence-matched fallback selections")
-        atomic_json(path, {"shots": valid or usable, "text": text, "used": usable, "fallback": used_fallback})
-        # A recovered checkpoint includes prior provenance, even when selected IDs replace an empty model list.
-        marked = set(used_fallback) | set(row.get("fallback", []))
-        evidence = tuple((candidates[sid].clip.start, candidates[sid].clip.end,
-                          ("Fallback evidence match: " if sid in marked else "Model observation: ") + candidates[sid].text)
-                         for sid in sorted(usable, key=lambda sid: candidates[sid].clip.start))
+        atomic_json(path, {"shots": valid or usable, "text": text, "used": usable,
+                           "fallback": sorted(prior_fallback | set(used_fallback)), "narration_complete": True})
+        chapter_rows.append((section_number, text.strip(), narration_terms, budget, model_ids, eligible, usable))
+        remaining -= frames
+
+    eligible = {sid: shot for row in chapter_rows for sid, shot in row[5].items()}
+    owners = {sid: index for index, row in enumerate(chapter_rows) for sid in row[5]}
+    inspected = {f"s{start}" for start in observations}
+    inspected.update(shots)
+    cut_rejections = 0
+    def report_duration(stage, frames, rejected, capacity=None):
+        values = {"selected_seconds": float(frames / movie.fps),
+                  "missing_seconds": float(max(0, goal - frames) / movie.fps),
+                  "eligible_candidates": len(eligible), "rejected_candidates": rejected}
+        if capacity is not None:
+            values["maximum_seconds"] = float(capacity / movie.fps)
+        record(report, stage=stage, **values)
+        progress(f"Duration recovery · {stage} · selected {values['selected_seconds']:.3f} s · "
+                 f"missing {values['missing_seconds']:.3f} s · {len(eligible)} eligible · {rejected} rejected")
+
+    route = [(clip, None) for clip in highlights]
+    route += [(eligible[sid].clip, sid) for row in chapter_rows for sid in row[6]]
+    route.sort(key=lambda entry: entry[0].start)
+    selected_frames = sum(clip.frames for clip, _ in route)
+    needs_recovery = selected_frames < goal or any(
+        adjacent_conflict(left, right, movie.fps, min_gap) for left, right in zip(picked, picked[1:]))
+    if needs_recovery:
+        report_duration("checking cached evidence", selected_frames, len(inspected - eligible.keys()))
+        boundaries = [(a[-1].clip.start + b[0].clip.start) // 2 for a, b in zip(groups, groups[1:])]
+        pending = [clip for clip in clips if f"s{clip.start}" not in inspected]
+        cached_only = True
+        while True:
+            route = longest_route(eligible, highlights, movie.fps, min_gap)
+            capacity = sum(clip.frames for clip, _ in route)
+            cut_rejections = len(eligible) - sum(sid is not None for _, sid in route)
+            report_duration(f"checking footage capacity ({float(capacity / movie.fps):.3f} s)",
+                            selected_frames, len(inspected - eligible.keys()) + cut_rejections, capacity)
+            if capacity >= goal or not pending or not expand or (not cached_only and not expand_live):
+                break
+            # Read older caches first, then analyze only as many additional candidates as needed.
+            batch = pending if cached_only else pending[:80]
+            expanded = expand(batch, progress, cache_only=cached_only)
+            if not cached_only:
+                pending = pending[len(batch):]
+                inspected.update(f"s{clip.start}" for clip in batch)
+            extra = registry(batch, expanded, movie, analysis.frames)
+            if cached_only:
+                pending = [clip for clip in pending if clip.start not in expanded]
+                cached_only = False
+            inspected.update(f"s{start}" for start in expanded)
+            for sid, shot in extra.items():
+                index = bisect_right(boundaries, shot.clip.start)
+                if tokens(shot.text) & chapter_rows[index][2]:
+                    eligible[sid] = shot
+                    owners[sid] = index
+            progress(f"Duration recovery · expanded evidence · {len(pending)} source candidates remaining")
+        if capacity < minimum or (highlights and not route):
+            reason = ("mandatory highlights cannot be connected under the cut rules" if highlights and not route
+                      else f"{len(eligible)} narration-matched candidates, {cut_rejections} excluded by "
+                           "the chronological cut rules")
+            message = (f"Maximum achievable duration with available evidence: {float(capacity / movie.fps):.3f} s. "
+                       f"{reason}. {len(inspected - eligible.keys())} reviewed candidates lacked usable matching evidence.")
+            if pending and not expand_live:
+                message += " Use Resume AI Review to analyze additional candidates."
+            report_duration("exhausted", capacity, len(inspected - eligible.keys()) + cut_rejections, capacity)
+            record(report, stage="duration exhausted", reason=reason, maximum_seconds=float(capacity / movie.fps),
+                   target_seconds=float(goal / movie.fps), unreviewed_candidates=len(clips) - len(inspected))
+            raise ValueError(message)
+        route = fit_route(route, owners, [row[3] for row in chapter_rows],
+                          set().union(*(row[4] for row in chapter_rows)), movie.fps, min_gap, goal, minimum)
+    picked = [clip for clip, _ in route]
+    selected_frames = sum(clip.frames for clip in picked)
+    report_duration("assembled", selected_frames, len(inspected - eligible.keys()) + cut_rejections)
+    if selected_frames > hard_limit:
+        raise ValueError("Valid grounded footage is available, but removing another edit would break a protected cut or underfill the target.")
+    selected_by_chapter = [[] for _ in chapter_rows]
+    for clip, sid in route:
+        if sid is not None:
+            selected_by_chapter[owners[sid]].append(sid)
+    for index, ((section_number, text, _, budget, model_ids, _, _), ids) in enumerate(
+            zip(chapter_rows, selected_by_chapter), 1):
+        evidence = tuple((eligible[sid].clip.start, eligible[sid].clip.end,
+                          ("Model observation: " if sid in model_ids else "Fallback evidence match: ") + eligible[sid].text)
+                         for sid in ids)
+        progress(f"Chapter duration · {index}/{len(chapter_rows)} · "
+                 f"{sum(eligible[sid].clip.frames for sid in ids) / movie.fps:.2f} s of {budget / movie.fps:.2f} s")
+        record(report, chapter=index, budget_frames=budget, selected=ids,
+               selected_frames=sum(eligible[sid].clip.frames for sid in ids),
+               fallback=[sid for sid in ids if sid not in model_ids])
+        if not evidence and not custom_parts:
+            continue
         section_id = f"part-{section_number + 1}"
         if sections and sections[-1].id == section_id:
             previous = sections[-1]
             sections[-1] = ScriptSection(section_id, previous.text, previous.evidence + evidence)
         else:
-            sections.append(ScriptSection(section_id, text.strip(), evidence))
-        remaining -= frames
-        if remaining <= 0:
-            break
-    if remaining > 5 * movie.fps or sum(clip.frames for clip in picked) / movie.fps < 1020:
-        raise ValueError("Grounded selections did not cover the target duration. Inspect the diagnostic report and retry planning.")
+            sections.append(ScriptSection(section_id, text, evidence))
     validate(picked, movie.fps, analysis.frames, final=True, has_audio=movie.has_audio, min_gap=min_gap)
     timeline = timeline_document(movie, picked, sections)
     recap_render.validate_timeline_physical(timeline, strict=True)

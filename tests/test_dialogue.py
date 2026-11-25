@@ -5,7 +5,7 @@ from unittest import TestCase, skipUnless
 import shutil
 
 from movie_review_studio import local_ai
-from movie_review_studio.dialogue import coverage, parse_captions
+from movie_review_studio.dialogue import coverage, missing_dialogue, parse_captions
 from movie_review_studio.media import ffmpeg
 
 
@@ -14,6 +14,13 @@ class DialogueTests(TestCase):
         data = "WEBVTT\n\n00:01.000 --> 00:03.000 align:start\n<i>سلام</i> Don’t close the door.\n"
         self.assertEqual(parse_captions(data), [{"start": 1, "end": 3, "text": "سلام Don’t close the door."}])
         self.assertEqual(coverage(parse_captions(data), 4), 50)
+
+    def test_missing_dialogue_distinguishes_subtitle_track_from_picture(self):
+        self.assertIn("Embedded subtitle tracks found", missing_dialogue({"subtitle_streams": 2}))
+        status = missing_dialogue({"subtitle_streams": 0})
+        self.assertIn("No embedded subtitle tracks", status)
+        self.assertIn("Burned-in subtitles, if present", status)
+        self.assertIn("transcription", status)
 
     @skipUnless(shutil.which("ffmpeg") and shutil.which("ffprobe"), "FFmpeg required")
     def test_embedded_english_is_preferred_and_empty_dialogue_is_explicit(self):
