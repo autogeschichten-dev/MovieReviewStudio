@@ -47,17 +47,17 @@ class RecapLibraryTests(unittest.TestCase):
             thumb = root / "frame.jpg"
             director.frames.extract_frames(source, [1.25], thumb, width=96, labels=False)
             self.assertTrue(thumb.read_bytes().startswith(b"\xff\xd8"))
-            clips = [Clip(0, 36, 0, (), (), ()), Clip(36, 72, 0, (), (), (), original=True)]
+            clips = [Clip(0, 36, 0, (), (), ()), Clip(48, 72, 0, (), (), (), original=True)]
             analysis = Analysis(72, 0, clips, ())
             section = director.ScriptSection("part-1", "La familia regresa.", ((0, 36, "Caption at 0.2s"),))
             doc = director.timeline_document(movie, clips, [section])
-            self.assertEqual(director.import_timeline(doc, movie, analysis), clips)
+            self.assertEqual(director.import_timeline(doc, movie, analysis, min_gap=1), clips)
             self.assertEqual(doc["meta"]["script_sections"][0]["placements"][0]["montage_out"], 3)
             report = director.recap_render.validate_timeline_physical(doc, strict=True)
-            self.assertEqual(report["duration_s"], 6)
+            self.assertEqual(report["duration_s"], 5)
             doc["video"][0]["out"] = 5.5
             with self.assertRaisesRegex(ValueError, "fragment"):
-                director.import_timeline(doc, movie, analysis)
+                director.import_timeline(doc, movie, analysis, min_gap=1)
 
     def test_mock_vision_contract_rejects_invented_shot_ids(self):
         from unittest.mock import patch

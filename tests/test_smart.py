@@ -2,7 +2,7 @@ from dataclasses import replace
 from fractions import Fraction
 import unittest
 
-from movie_review_studio.model import Clip, Signature, timeline_entries, validate
+from movie_review_studio.model import Clip, Signature, source_gap, timeline_entries, validate
 from movie_review_studio.smart import AudioEvidence, assemble, caption_ranges
 
 
@@ -13,14 +13,15 @@ class SmartEditingTests(unittest.TestCase):
         for index in range(310):
             value = index * 97 % 256
             signature = Signature(index * 0x45D9F3B, f'{value:02x}' * 256)
-            start = index * 120
+            start = index * 240
             candidates.append(Clip(start, start + 119, float(index % 7), (signature,),
                                    (signature,), (signature,), shot=index))
         candidates[0] = replace(candidates[0], production_card=True, score=999)
-        clips = assemble(candidates, [], fps, 39000, 1050, AudioEvidence(), lambda _: None)
-        validate(clips, fps, 39000, final=True, has_audio=False)
+        clips = assemble(candidates, [], fps, 75000, 1050, AudioEvidence(), lambda _: None)
+        validate(clips, fps, 75000, final=True, has_audio=False)
         self.assertEqual(clips, sorted(clips, key=lambda clip: clip.start))
         self.assertNotIn(candidates[0], clips)
+        self.assertTrue(all(source_gap(a, b) / fps >= 5 for a, b in zip(clips, clips[1:])))
         entries = timeline_entries(clips, fps)
         self.assertTrue(all(entry.segment.frames / fps <= 5 for entry in entries))
         self.assertLessEqual(abs(sum(clip.frames for clip in clips) / fps - 1050), 5)

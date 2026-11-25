@@ -10,7 +10,7 @@ import wave
 
 from .analysis import Analysis
 from .media import Media, ffmpeg, identity, invoke, seconds, video_seek
-from .model import Clip, MAX_CLIP_SECONDS, timeline_entries, validate
+from .model import DEFAULT_SOURCE_GAP, Clip, MAX_CLIP_SECONDS, timeline_entries, validate
 
 RATE = 48000
 VERSION = "render-6"
@@ -175,9 +175,11 @@ def render_selection(movie: Media, analysis: Analysis, clips: list[Clip], row: i
 
 
 def render(movie: Media, analysis: Analysis, clips: list[Clip], voice: Path | None,
-           music: Path | None, cache: Path, progress, *, destination: Path | None = None, mix: Mix | None = None) -> Path:
+           music: Path | None, cache: Path, progress, *, destination: Path | None = None, mix: Mix | None = None,
+           min_gap=DEFAULT_SOURCE_GAP) -> Path:
     preview = destination is None
-    validate(clips, movie.fps, analysis.frames, final=not preview, has_audio=movie.has_audio)
+    validate(clips, movie.fps, analysis.frames, final=not preview, has_audio=movie.has_audio,
+             min_gap=min_gap, enforce_separation=not preview)
     entries = timeline_entries(clips, movie.fps)
     identities = [identity(path) if path else None for path in (movie.path, voice, music)]
     key_data = (VERSION, identities, [(c.start, c.end, c.highlight, c.cuts, c.original, c.muted) for c in clips],

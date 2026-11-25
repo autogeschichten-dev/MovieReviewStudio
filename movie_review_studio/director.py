@@ -17,7 +17,7 @@ import wave
 
 from .analysis import atomic_json, fingerprint_highlight
 from .media import ffmpeg, identity
-from .model import adjacent_conflict, overlaps, timeline_entries, validate
+from .model import DEFAULT_SOURCE_GAP, adjacent_conflict, overlaps, timeline_entries, validate
 from .recap_upstream._common import timeline_video_spans
 from .recap_upstream import check, frames, probe, render as recap_render, transcribe, tts
 
@@ -150,7 +150,7 @@ def timeline_document(movie, clips, sections=(), audio_files=None):
             "audio": {"narration": audio_files or []}}
 
 
-def import_timeline(document, movie, analysis, cache=None):
+def import_timeline(document, movie, analysis, cache=None, *, min_gap=DEFAULT_SOURCE_GAP):
     if document.get("schema_version") != 3 or set(document.get("sources", {})) != {"movie"}:
         raise ValueError("Expected a Video Recap Skills v3 timeline with one Movie Review Studio source.")
     if Path(document["sources"]["movie"]).resolve() != movie.path.resolve():
@@ -191,7 +191,7 @@ def import_timeline(document, movie, analysis, cache=None):
             clip = fingerprint_highlight(movie, analysis, ranges[0][0], ranges[-1][1],
                                          cuts=tuple(start for start, _, _ in ranges[1:]), cache=cache)
             result.append(replace(clip, muted=ranges[0][2] == "mute"))
-    validate(result, movie.fps, analysis.frames, has_audio=movie.has_audio)
+    validate(result, movie.fps, analysis.frames, has_audio=movie.has_audio, min_gap=min_gap)
     return result
 
 
@@ -229,7 +229,7 @@ def sample_group(group):
 
 
 def plan(movie, analysis, highlights, provider, mode, language, target, custom, cache, progress,
-         *, observations=None, transcript=None, report=None):
+         *, observations=None, transcript=None, report=None, min_gap=DEFAULT_SOURCE_GAP):
     progress("Probing source with Video Recap Skills…")
     metadata = probe.probe_sources([movie.path])
     if not metadata["sources"][0].get("has_video"):
@@ -263,7 +263,7 @@ def plan(movie, analysis, highlights, provider, mode, language, target, custom, 
         from .planning import plan as plan_grounded
         return plan_grounded(movie, analysis, highlights, provider, mode, language, target, custom, cache,
                              progress, candidates, observations, transcript,
-                             custom_parts if mode == "Custom Script" else [], report)
+                             custom_parts if mode == "Custom Script" else [], report, min_gap=min_gap)
     all_clips = sorted(highlights, key=lambda c: c.start)
     frame_dir = cache / f"recap-frames-{identity(movie.path)}"
     frame_dir.mkdir(exist_ok=True)
@@ -346,9 +346,9 @@ def plan(movie, analysis, highlights, provider, mode, language, target, custom, 
                 break
             neighbors = sorted([*all_clips, clip], key=lambda c: c.start)
             at = neighbors.index(clip)
-            if at and adjacent_conflict(neighbors[at - 1], clip):
+            if at and adjacent_conflict(neighbors[at - 1], clip, movie.fps, min_gap):
                 continue
-            if at + 1 < len(neighbors) and adjacent_conflict(clip, neighbors[at + 1]):
+            if at + 1 < len(neighbors) and adjacent_conflict(clip, neighbors[at + 1], movie.fps, min_gap):
                 continue
             if used_frames + clip.frames > remaining + min(int(5 * movie.fps), int(1080 * movie.fps) - goal):
                 continue
@@ -371,7 +371,7 @@ def plan(movie, analysis, highlights, provider, mode, language, target, custom, 
     duration = sum(c.frames for c in all_clips) / movie.fps
     if not 1020 <= duration <= 1080 or remaining > 5 * movie.fps:
         raise ValueError("The director did not find enough grounded footage to meet the target. Fast Montage remains available.")
-    validate(all_clips, movie.fps, analysis.frames, final=True, has_audio=movie.has_audio)
+    validate(all_clips, movie.fps, analysis.frames, final=True, has_audio=movie.has_audio, min_gap=min_gap)
     recap_render.validate_timeline_physical(timeline_document(movie, all_clips, sections), strict=True)
     return all_clips, sections
 

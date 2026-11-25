@@ -9,7 +9,7 @@ import re
 
 from .analysis import atomic_json
 from . import local_ai
-from .model import adjacent_conflict, validate
+from .model import DEFAULT_SOURCE_GAP, adjacent_conflict, validate
 from .recap_upstream import render as recap_render
 
 VERSION = 2
@@ -205,7 +205,7 @@ def tokens(text):
 
 
 def plan(movie, analysis, highlights, provider, mode, language, target, custom, cache, progress,
-         clips, observations, transcript, custom_parts, report=None):
+         clips, observations, transcript, custom_parts, report=None, *, min_gap=DEFAULT_SOURCE_GAP):
     from .director import ScriptSection, timeline_document
 
     shots = registry(clips, observations, movie, analysis.frames)
@@ -216,7 +216,7 @@ def plan(movie, analysis, highlights, provider, mode, language, target, custom, 
     report = report or cache / "ai-planning-diagnostic.jsonl"
     planner = TextPlanner(provider, report)
     stamp = [VERSION, planner.model_version, planner.context, getattr(provider, "url", ""), mode, language,
-             target, custom, list((sid, row.clip.end, row.text, row.time, row.uncertain) for sid, row in shots.items()),
+             target, custom, min_gap, list((sid, row.clip.end, row.text, row.time, row.uncertain) for sid, row in shots.items()),
              [(c.start, c.end) for c in highlights], transcript, str(movie.fps)]
     from .media import identity
     stamp.append(identity(movie.path))
@@ -379,8 +379,8 @@ def plan(movie, analysis, highlights, provider, mode, language, target, custom, 
                 continue
             neighbors = sorted([*picked, clip], key=lambda item: item.start)
             at = neighbors.index(clip)
-            if (at and adjacent_conflict(neighbors[at - 1], clip)
-                    or at + 1 < len(neighbors) and adjacent_conflict(clip, neighbors[at + 1])):
+            if (at and adjacent_conflict(neighbors[at - 1], clip, movie.fps, min_gap)
+                    or at + 1 < len(neighbors) and adjacent_conflict(clip, neighbors[at + 1], movie.fps, min_gap)):
                 continue
             usable.append(sid)
             frames += clip.frames
@@ -408,7 +408,7 @@ def plan(movie, analysis, highlights, provider, mode, language, target, custom, 
             break
     if remaining > 5 * movie.fps or sum(clip.frames for clip in picked) / movie.fps < 1020:
         raise ValueError("Grounded selections did not cover the target duration. Inspect the diagnostic report and retry planning.")
-    validate(picked, movie.fps, analysis.frames, final=True, has_audio=movie.has_audio)
+    validate(picked, movie.fps, analysis.frames, final=True, has_audio=movie.has_audio, min_gap=min_gap)
     timeline = timeline_document(movie, picked, sections)
     recap_render.validate_timeline_physical(timeline, strict=True)
     atomic_json(directory / "timeline.json", timeline)

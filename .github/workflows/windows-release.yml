@@ -164,7 +164,11 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
+          title="Movie Review Studio for Windows x64 ($RELEASE_TAG)"
+          if [[ "$RELEASE_TAG" == "stage3-windows-v3.1.4" ]]; then
+            title="Movie Review Studio V3.1.4 — Anti-Adjacent Protection Update"
+          fi
           gh release create "$RELEASE_TAG" "$ZIP_NAME" \
             --repo "$GITHUB_REPOSITORY" --verify-tag \
-            --title "Movie Review Studio for Windows x64 ($RELEASE_TAG)" \
+            --title "$title" \
             --notes "Extract the ZIP and double-click RUN_WINDOWS.bat or MovieReviewStudio.exe. Keep the extracted folder together."

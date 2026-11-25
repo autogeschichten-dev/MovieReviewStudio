@@ -26,7 +26,8 @@ from .media import Cancelled, cancellation, identity, inspect, invoke
 from . import director, local_ai
 from .ai_settings import AISettingsDialog, model_choices, settings
 from .editor import SceneModel, Timeline, TrackLabels, thumbnail
-from .model import adjacent_conflict, overlaps, replacement, timeline_entries, validate
+from .model import (DEFAULT_SOURCE_GAP, adjacent_conflict, overlaps, replacement, separation_issues,
+                    timeline_entries, timeline_validation_report, validate)
 from .render import Mix, render, render_selection
 from .smart import AudioEvidence, LocalWhisper, assemble, audio_evidence, suggest_highlights
 
@@ -535,6 +536,7 @@ class Studio(QMainWindow):
                 return
         content_mode, lang, text = mode.currentText(), language.currentText(), code.toPlainText()
         target = self.target.value()
+        min_gap = self.source_gap.value()
         include_highlights = highlights_enabled.isChecked()
         chosen_subtitles = subtitle_path.text().strip() or None
         use_ocr, use_translation = ocr.isChecked(), translate.isChecked()
@@ -584,7 +586,7 @@ class Studio(QMainWindow):
             try:
                 clips, script = director.plan(self.movie, analysis, highlights, provider, content_mode, lang,
                                               target, text, self.cache, progress, observations=observations,
-                                              transcript=cues, report=report_path)
+                                              transcript=cues, report=report_path, min_gap=min_gap)
             except Exception:
                 if local_planner:
                     try:
@@ -772,7 +774,7 @@ class Studio(QMainWindow):
         path, _ = QFileDialog.getOpenFileName(self, "Import timeline", "", "JSON (*.json)")
         if path:
             payload = json.loads(Path(path).read_text(encoding="utf-8"))
-            clips = director.import_timeline(payload, self.movie, self.analysis, self.cache)
+            clips = director.import_timeline(payload, self.movie, self.analysis, self.cache, min_gap=self.source_gap.value())
             self.record_edit()
             self.script = []
             self.script_approved = False
@@ -891,6 +893,16 @@ class Studio(QMainWindow):
         self.final_summary = QLabel()
         self.final_summary.setWordWrap(True)
         layout.addWidget(self.final_summary)
+        gap_form = QFormLayout()
+        self.source_gap = QSpinBox()
+        self.source_gap.setRange(0, 120)
+        self.source_gap.setValue(DEFAULT_SOURCE_GAP)
+        self.source_gap.setSuffix(" s")
+        self.source_gap.setToolTip("Required source-time gap between consecutive separate edits. Touching ranges are always blocked.")
+        gap_form.addRow("Minimum source separation", self.source_gap)
+        layout.addLayout(gap_form)
+        self.source_gap.valueChanged.connect(lambda _: self.refresh() if hasattr(self, "timeline") else None)
+        layout.addWidget(self.button("Save timeline validation report…", self.save_timeline_report))
         self.export_button = self.button("Validate and export MP4…", self.export)
         self.export_button.setObjectName("primary")
         layout.addWidget(self.export_button)
@@ -1122,9 +1134,9 @@ class Studio(QMainWindow):
                 if any(overlaps(clip, item) for item in edits):
                     raise ValueError("This highlight overlaps a timeline clip. Choose another range or delete the clip first.")
                 for slot in range(len(edits), -1, -1):
-                    if slot and adjacent_conflict(edits[slot - 1], clip):
+                    if slot and adjacent_conflict(edits[slot - 1], clip, self.movie.fps, self.source_gap.value()):
                         continue
-                    if slot < len(edits) and adjacent_conflict(clip, edits[slot]):
+                    if slot < len(edits) and adjacent_conflict(clip, edits[slot], self.movie.fps, self.source_gap.value()):
                         continue
                     edits.insert(slot, clip)
                     break
@@ -1180,6 +1192,7 @@ class Studio(QMainWindow):
         ) != QMessageBox.StandardButton.Yes:
             return
         target = self.target.value()
+        min_gap = self.source_gap.value()
         self.tabs.setCurrentIndex(1)
 
         def build(progress):
@@ -1188,13 +1201,13 @@ class Studio(QMainWindow):
             highlights = self.highlights or suggest_highlights(self.movie, analysis, evidence, self.cache, progress)
             try:
                 clips = assemble(analysis.candidates, highlights, self.movie.fps, analysis.frames,
-                                 target, evidence, progress)
+                                 target, evidence, progress, min_gap=min_gap)
             except ValueError:
                 if self.highlights or not highlights:
                     raise
                 highlights = []
                 clips = assemble(analysis.candidates, highlights, self.movie.fps, analysis.frames,
-                                 target, evidence, progress)
+                                 target, evidence, progress, min_gap=min_gap)
             return analysis, evidence, highlights, clips
 
         def apply(result):
@@ -1308,8 +1321,14 @@ class Studio(QMainWindow):
         self.select_row(row)
         self.seek_timeline(self.entries[row].position / self.timeline.total)
 
-    def check(self, clips, final=False):
-        validate(clips, self.movie.fps, self.analysis.frames, final=final, has_audio=self.movie.has_audio)
+    def check(self, clips, final=False, *, preview=False):
+        fps = self.movie.fps
+        gap = self.source_gap.value()
+        # Earlier edits can remain previewable and be repaired incrementally.
+        enforce = final or not (preview or
+            separation_issues(clips, fps, gap).keys() <= separation_issues(self.clips, fps, gap).keys())
+        validate(clips, fps, self.analysis.frames, final=final, has_audio=self.movie.has_audio,
+                 min_gap=gap, enforce_separation=enforce)
 
     def selected_row(self):
         index = self.selected_clip_row
@@ -1383,7 +1402,8 @@ class Studio(QMainWindow):
             self.statusBar().showMessage("Set a continuous source range, then click Replace in Cut.")
             return
         edits = self.clips.copy()
-        edits[index] = replacement(edits, index, self.analysis.candidates)
+        edits[index] = replacement(edits, index, self.analysis.candidates,
+                                   fps=self.movie.fps, min_gap=self.source_gap.value())
         self.check(edits)
         self.set_clips(edits)
         self.select_edit(index)
@@ -1459,7 +1479,7 @@ class Studio(QMainWindow):
 
     def preview(self, clips, *, assembly=False):
         self.require_movie(True)
-        self.check(clips)
+        self.check(clips, preview=True)
         voice = self.voice if assembly else None
         music = self.music if assembly else None
         label = "Montage preview" if assembly else "Source range preview"
@@ -1628,9 +1648,9 @@ class Studio(QMainWindow):
             if mode == 4:
                 if edit is None or self.clips[edit].highlight or any(overlaps(clip, item) for item in self.clips):
                     continue
-                if edit and adjacent_conflict(self.clips[edit - 1], clip):
+                if edit and adjacent_conflict(self.clips[edit - 1], clip, self.movie.fps, self.source_gap.value()):
                     continue
-                if edit + 1 < len(self.clips) and adjacent_conflict(clip, self.clips[edit + 1]):
+                if edit + 1 < len(self.clips) and adjacent_conflict(clip, self.clips[edit + 1], self.movie.fps, self.source_gap.value()):
                     continue
             label = f"{row + 1}  ·  {clock(clip.start / self.movie.fps)}\n{float(clip.frames / self.movie.fps):.2f} s  ·  {status}"
             if all(term in label.casefold() for term in terms):
@@ -1675,6 +1695,10 @@ class Studio(QMainWindow):
         self.final_summary.setText(f"{len(entries)} video segments · {clock(cursor / movie.fps if movie else 0)}\n"
                                    f"{sum(clip.highlight and clip.movie_audio for clip in self.clips)} original-audio highlights in timeline\n"
                                    "H.264 video · AAC stereo · MP4")
+        if movie and self.clips:
+            conflicts = len(separation_issues(self.clips, movie.fps, self.source_gap.value()))
+            if conflicts:
+                self.final_summary.setText(self.final_summary.text() + f"\n{conflicts} source separation cuts to repair before export.")
         self.export_button.setEnabled(bool(self.clips))
 
     def save_project(self):
@@ -1687,7 +1711,7 @@ class Studio(QMainWindow):
             raise ValueError("Save the edit to a different file from the imported media.")
         linked = director.placements(self.script, self.clips, self.movie.fps)
         atomic_json(destination, {
-            "version": 4, "director": {"sections": [dict(vars(s), placements=linked[s.id]) for s in self.script],
+            "version": 4, "minimum_source_gap_seconds": self.source_gap.value(), "director": {"sections": [dict(vars(s), placements=linked[s.id]) for s in self.script],
                                         "approved": self.script_approved, "mode": self.director_mode,
                                         "language": self.director_language, "generated_voice": str(self.generated_voice) if self.generated_voice else None},
             "mix": vars(self.mix), "movie": str(self.movie.path), "source_key": self.source_key,
@@ -1728,7 +1752,7 @@ class Studio(QMainWindow):
             except KeyError as error:
                 raise ValueError("A saved clip is missing from the source analysis.") from error
             if clips:
-                validate(clips, movie.fps, analysis.frames, has_audio=movie.has_audio)
+                validate(clips, movie.fps, analysis.frames, has_audio=movie.has_audio, enforce_separation=False)
             ordered = sorted(highlights, key=lambda clip: clip.start)
             if len(ordered) > 3 or any(a.end > b.start for a, b in zip(ordered, ordered[1:])):
                 raise ValueError("The saved highlights overlap or exceed the limit of three.")
@@ -1746,6 +1770,9 @@ class Studio(QMainWindow):
 
         def apply(result):
             payload, self.movie, self.analysis, self.highlights, self.clips, tracks, self.waves = result
+            self.source_gap.blockSignals(True)
+            self.source_gap.setValue(payload.get("minimum_source_gap_seconds", DEFAULT_SOURCE_GAP))
+            self.source_gap.blockSignals(False)
             self.mix = Mix(**payload.get("mix", {}))
             self.sync_mix()
             self.undo_stack.clear()
@@ -1789,6 +1816,24 @@ class Studio(QMainWindow):
 
         self.background("Checking exported video…", work, done)
 
+    def validation_report(self):
+        return timeline_validation_report(self.clips, self.movie.fps, self.analysis.frames,
+                                          has_audio=self.movie.has_audio, min_gap=self.source_gap.value())
+
+    def save_timeline_report(self):
+        self.require_movie(True)
+        path, _ = QFileDialog.getSaveFileName(self, "Save timeline report", "Review.timeline-validation.json",
+                                               "JSON (*.json)")
+        if path:
+            destination = Path(path)
+            self.check_output_path(destination)
+            atomic_json(destination, self.validation_report())
+            self.statusBar().showMessage(f"Saved timeline validation report to {destination}")
+
+    def check_output_path(self, destination):
+        if destination.resolve() in {item.resolve() for item in (self.movie.path, self.voice, self.music) if item}:
+            raise ValueError("Choose a different output path from the imported media.")
+
     def export(self):
         self.require_movie(True)
         self.check(self.clips, final=True)
@@ -1798,10 +1843,20 @@ class Studio(QMainWindow):
         destination = Path(path)
         if destination.suffix.lower() != ".mp4":
             raise ValueError("Choose an .mp4 export filename.")
+        report_path = destination.with_suffix(".timeline-validation.json")
+        self.check_output_path(report_path)
+        report = self.validation_report()
+        min_gap = report["minimum_source_gap_seconds"]
         self.player.stop()
-        self.background("Exporting review…", lambda progress: render(
-            self.movie, self.analysis, self.clips, self.voice, self.music, self.cache, progress,
-            destination=destination, mix=self.mix), lambda output: QMessageBox.information(self, "Export complete", str(output)))
+
+        def work(progress):
+            output = render(self.movie, self.analysis, self.clips, self.voice, self.music, self.cache, progress,
+                            destination=destination, mix=self.mix, min_gap=min_gap)
+            atomic_json(report_path, report)
+            return output
+
+        self.background("Exporting review…", work,
+                        lambda output: QMessageBox.information(self, "Export complete", f"{output}\n{report_path}"))
 
 
 STYLE = """

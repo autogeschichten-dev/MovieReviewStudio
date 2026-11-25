@@ -9,7 +9,7 @@ import json
 from movie_review_studio import local_ai, planning
 from movie_review_studio.director import chapters, sample_group
 from movie_review_studio.media import Cancelled, identity
-from movie_review_studio.model import Clip
+from movie_review_studio.model import Clip, source_gap
 
 
 class RecoveryTests(TestCase):
@@ -48,7 +48,8 @@ class RecoveryTests(TestCase):
             source = root / "film.mp4"
             source.write_bytes(b"fixture")
             movie = SimpleNamespace(path=source, fps=Fraction(1), width=96, height=64, has_audio=False)
-            clips = [Clip(i * 8, i * 8 + 2, 1, (), (), (), shot=i) for i in range(640)]
+            starts = [i * 8 - (4 if i and i % 8 == 0 else 0) for i in range(640)]
+            clips = [Clip(start, start + 2, 1, (), (), (), shot=i) for i, start in enumerate(starts)]
             analysis = SimpleNamespace(frames=5120, candidates=clips)
             selected = [clip for group in chapters(clips, 16) for clip in sample_group(group)]
             self.assertEqual(len(selected), 640)
@@ -131,6 +132,7 @@ class RecoveryTests(TestCase):
                 self.assertTrue(any("Fallback evidence match:" in obs for section in sections for _, _, obs in section.evidence))
                 self.assertEqual(sum(clip.frames for clip in timeline), 1050)
                 self.assertTrue(all(clip.frames <= 5 for clip in timeline))
+                self.assertTrue(all(source_gap(a, b) >= 5 for a, b in zip(timeline, timeline[1:])))
                 stale = first_dir / "chapter-1.json"
                 stale.write_text('{"text":"stale","shots":["s999999"]}', encoding="utf-8")
                 stages.clear()

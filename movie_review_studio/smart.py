@@ -12,7 +12,7 @@ import numpy as np
 
 from .analysis import atomic_json, fingerprint_highlight
 from .media import ffmpeg, identity, invoke
-from .model import adjacent_conflict, overlaps, similar, validate
+from .model import DEFAULT_SOURCE_GAP, adjacent_conflict, overlaps, similar, validate
 
 PEAKS_PER_SECOND = 20
 
@@ -153,7 +153,8 @@ def suggest_highlights(movie, analysis, evidence, cache, progress):
     return sorted(selected, key=lambda clip: clip.start)
 
 
-def assemble(candidates, highlights, fps, source_frames, target_seconds, evidence, progress):
+def assemble(candidates, highlights, fps, source_frames, target_seconds, evidence, progress, *,
+             min_gap=DEFAULT_SOURCE_GAP):
     """Distribute selected footage over the source and keep its source order."""
     minimum = math.ceil(1020 * fps)
     ceiling = int(1080 * fps)
@@ -188,8 +189,8 @@ def assemble(candidates, highlights, fps, source_frames, target_seconds, evidenc
                 slot = bisect_left(starts, clip.start)
                 left = selected[slot - 1] if slot else None
                 right = selected[slot] if slot < len(selected) else None
-                if ((left and (overlaps(left, clip) or adjacent_conflict(left, clip))) or
-                    (right and (overlaps(right, clip) or adjacent_conflict(clip, right)))):
+                if ((left and (overlaps(left, clip) or adjacent_conflict(left, clip, fps, min_gap))) or
+                    (right and (overlaps(right, clip) or adjacent_conflict(clip, right, fps, min_gap)))):
                     continue
                 selected.insert(slot, clip)
                 starts.insert(slot, clip.start)
@@ -207,6 +208,6 @@ def assemble(candidates, highlights, fps, source_frames, target_seconds, evidenc
                 break
             prefer_distinct = False
     if frames < minimum or frames < target - math.ceil(5 * fps):
-        raise ValueError('There is insufficient distinct usable footage for the chosen 17–18 minute target.')
-    validate(selected, fps, source_frames, final=True)
+        raise ValueError('There is insufficient distinct usable footage for the chosen 17–18 minute target and source separation.')
+    validate(selected, fps, source_frames, final=True, min_gap=min_gap)
     return selected

@@ -183,12 +183,12 @@ class MediaTests(unittest.TestCase):
         clips = [Clip(start, end, 0, (), (), ()) for start, end in ((0, 5), (6, 8), (10, 15))]
         export = self.root / "mixed-length-export.mp4"
 
-        def short_fixture(items, fps, frames, *, final, has_audio):
+        def short_fixture(items, fps, frames, *, final, **policy):
             self.assertTrue(final)
-            validate(items, fps, frames, has_audio=has_audio)
+            validate(items, fps, frames, **policy)
 
         with patch("movie_review_studio.render.validate", side_effect=short_fixture):
-            render(media, analysis, clips, None, None, self.root, lambda _: None, destination=export, mix=Mix())
+            render(media, analysis, clips, None, None, self.root, lambda _: None, destination=export, mix=Mix(), min_gap=1)
         self.assertEqual(frame_clock(inspect(export))[0], 12)
 
     def test_editor_scene_controls_and_project_round_trip(self):
@@ -207,6 +207,16 @@ class MediaTests(unittest.TestCase):
         studio.movie, studio.source_key, studio.analysis = self.media, identity(self.movie), analysis
         studio.highlights = [highlight]
         studio.set_clips([candidates[0], highlight, candidates[2]])
+        self.assertEqual(studio.source_gap.value(), 5)
+        self.assertFalse(studio.validation_report()["passed"])
+        with patch("movie_review_studio.app.QFileDialog.getSaveFileName") as picker:
+            with self.assertRaisesRegex(ValueError, "configured separation"):
+                studio.export()
+            picker.assert_not_called()
+        with self.assertRaisesRegex(ValueError, "configured separation"):
+            studio.check([candidates[0], candidates[1]])
+        studio.source_gap.setValue(0)
+
 
         self.assertIn("Selected", studio.scene_model.rows[0][2])
         self.assertIn("Original audio", studio.scene_model.rows[1][2])
@@ -262,11 +272,14 @@ class MediaTests(unittest.TestCase):
             studio.set_clips([])
             studio.open_project()
             self.assertEqual(studio.clips, expected)
+            self.assertEqual(studio.source_gap.value(), 0)
             legacy = json.loads(project.read_text(encoding="utf-8"))
+            legacy.pop("minimum_source_gap_seconds")
             legacy.update(version=1, target=18, highlights=[[24, 144]],
                           clips=[item[:3] for item in legacy["clips"]])
             project.write_text(json.dumps(legacy), encoding="utf-8")
             studio.open_project()
+            self.assertEqual(studio.source_gap.value(), 5)
         self.assertEqual(studio.clips, expected)
         self.assertEqual([entry.segment.highlight for entry in studio.entries], [False, False, True, True, True])
         self.assertEqual((studio.voice, studio.music, studio.title.text(), studio.year.value(), studio.target.value()),
