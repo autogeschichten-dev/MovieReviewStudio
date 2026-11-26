@@ -19,6 +19,7 @@ permissions:
 env:
   ZIP_NAME: MovieReviewStudio-Windows-x64.zip
   RELEASE_TAG: ${{ inputs.release_tag || github.ref_name }}
+  REUSE_WINDOWS_MEDIA: ${{ startsWith(inputs.release_tag || github.ref_name, 'stage3-windows-v3.0.') || startsWith(inputs.release_tag || github.ref_name, 'stage3-windows-v3.1.') }}
 
 jobs:
   build:
@@ -49,7 +50,7 @@ jobs:
           }
 
       - uses: msys2/setup-msys2@v2
-        if: ${{ !startsWith(env.RELEASE_TAG, 'stage3-') }}
+        if: env.REUSE_WINDOWS_MEDIA == 'false'
         with:
           msystem: UCRT64
           install: >-
@@ -59,12 +60,17 @@ jobs:
             mingw-w64-ucrt-x86_64-pkgconf
 
       - name: Build FFmpeg and FFprobe
-        if: ${{ !startsWith(env.RELEASE_TAG, 'stage3-') }}
+        if: env.REUSE_WINDOWS_MEDIA == 'false'
         shell: msys2 {0}
-        run: bash packaging/build-ffmpeg-windows.sh
+        run: |
+          if [[ "$RELEASE_TAG" == stage3-* ]]; then
+            bash packaging/build-ffmpeg-windows.sh --with-lame
+          else
+            bash packaging/build-ffmpeg-windows.sh
+          fi
 
       - name: Reuse verified Windows media binaries and corresponding source
-        if: startsWith(env.RELEASE_TAG, 'stage3-')
+        if: env.REUSE_WINDOWS_MEDIA == 'true'
         run: |
           $archive = Join-Path $env:RUNNER_TEMP 'verified-media-tools.zip'
           $extract = Join-Path $env:RUNNER_TEMP 'verified-media-tools'
@@ -91,6 +97,11 @@ jobs:
           foreach ($name in 'ffmpeg.exe', 'ffprobe.exe') {
             if ((Get-Command $name).Source -ne (Join-Path $tools $name)) {
               throw "Tests would use a different copy of $name."
+            }
+          }
+          if ($env:RELEASE_TAG -like 'stage3-*' -and $env:REUSE_WINDOWS_MEDIA -eq 'false') {
+            if (!(ffmpeg -hide_banner -encoders | Select-String '\blibmp3lame\b')) {
+              throw 'The Windows FFmpeg build is missing the MP3 encoder.'
             }
           }
           python -m unittest discover -s tests -v
@@ -172,8 +183,8 @@ jobs:
             title="Movie Review Studio V3.1.4 — Anti-Adjacent Protection Update"
           elif [[ "$RELEASE_TAG" == "stage3-windows-v3.1.5" ]]; then
             title="Movie Review Studio V3.1.5 — AI Planning Duration Recovery"
-          elif [[ "$RELEASE_TAG" == "stage3-windows-v3.2.0" ]]; then
-            title="Movie Review Studio V3.2.0 — Multi-Part Voice-over Manager"
+          elif [[ "$RELEASE_TAG" == "stage3-windows-v3.2.1" ]]; then
+            title="Movie Review Studio V3.2.1 — Multi-Part Voice-over Manager"
           fi
           gh release create "$RELEASE_TAG" "$ZIP_NAME" \
             --repo "$GITHUB_REPOSITORY" --verify-tag \

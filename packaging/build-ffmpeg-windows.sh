@@ -22,6 +22,25 @@ fetch_source() {
 fetch_source x264 https://github.com/mirror/x264.git "$x264_commit"
 fetch_source ffmpeg https://github.com/FFmpeg/FFmpeg.git "$ffmpeg_commit"
 
+encoder_flags=()
+link_flags="-static"
+if [[ ${1:-} == --with-lame ]]; then
+    lame_archive="$workspace/lame-3.100.tar.gz"
+    curl --fail --location --retry 3 \
+        https://deb.debian.org/debian/pool/main/l/lame/lame_3.100.orig.tar.gz -o "$lame_archive"
+    printf '%s  %s\n' ddfe36cab873794038ae2c1210557ad34857a4b6bdc515785d1da9e175b1da1e "$lame_archive" | sha256sum -c -
+    tar -xzf "$lame_archive" -C "$workspace"
+    (
+        cd "$workspace/lame-3.100"
+        ./configure --host=x86_64-w64-mingw32 --prefix="$prefix" --enable-static \
+            --disable-shared --disable-frontend --disable-nasm
+        make -j"$(nproc)"
+        make install
+    )
+    encoder_flags=(--enable-libmp3lame "--extra-cflags=-I$prefix/include")
+    link_flags+=" -L$prefix/lib"
+fi
+
 (
     cd "$workspace/x264"
     ./configure --host=x86_64-w64-mingw32 --prefix="$prefix" --enable-static --disable-cli --disable-opencl
@@ -34,7 +53,7 @@ fetch_source ffmpeg https://github.com/FFmpeg/FFmpeg.git "$ffmpeg_commit"
         --arch=x86_64 --target-os=mingw32 --disable-autodetect \
         --disable-shared --enable-static --disable-doc --disable-ffplay \
         --enable-gpl --enable-libx264 --pkg-config-flags=--static \
-        --extra-ldflags=-static
+        --extra-ldflags="$link_flags" "${encoder_flags[@]}"
     make -j"$(nproc)"
 )
 
@@ -45,4 +64,8 @@ git -C "$workspace/ffmpeg" archive --format=zip --prefix=ffmpeg/ \
 git -C "$workspace/x264" archive --format=zip --prefix=x264/ \
     -o "$output/source/x264.zip" HEAD
 cp "$workspace/ffmpeg/COPYING.GPLv2" "$output/source/"
+if [[ -n ${lame_archive:-} ]]; then
+    cp "$lame_archive" "$output/source/"
+    cp "$workspace/lame-3.100/COPYING" "$output/source/LAME-COPYING"
+fi
 cp "$repo_root/packaging/build-ffmpeg-windows.sh" "$output/source/"
