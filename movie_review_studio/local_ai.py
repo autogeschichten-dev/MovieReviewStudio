@@ -101,7 +101,8 @@ def normalize_observation(raw):
                 if isinstance(item, str) and item.strip()] if isinstance(value, list) else []
 
     def acceptable(line):
-        return (bool(re.search(r"[A-Za-zÀ-ſ]{2,}", line)) and
+        return (bool(re.search(r"[^\W\d_]{2,}", line)) and
+                not re.fullmatch(r"[\s\d.,():xXyYwWhH=+%\[\]\-]+", line) and
                 not re.fullmatch(r"(?:unknown|none|null|n/?a|nothing(?: visible)?|no description)[.! ]*", line, re.I) and
                 not re.match(r"(?:sorry|i (?:cannot|can't|can not|don't|am unable)|no image|unable to)", line, re.I))
 
@@ -135,11 +136,19 @@ def describe_image(path, model, source_time, *, keep_alive="2m", prompt=PROMPT, 
     payload = {
         "model": model, "prompt": prompt, "images": [b64encode(image).decode("ascii")],
         "stream": False, "keep_alive": keep_alive,
-        "options": {"num_ctx": 2048, "num_predict": 160, "temperature": 0},
+        "options": {"num_ctx": 2048, "num_predict": 256, "temperature": 0},
     }
     kwargs = {"trace": trace} if trace else {}
     output = request("/api/generate", payload, timeout=60, **kwargs)
-    values = normalize_observation(output.get("response"))
+    response = output.get("response")
+    if output.get("done_reason") == "length" and isinstance(response, str):
+        if response.lstrip().startswith(("{", "[", "```")):
+            raise ObservationError("Moondream hit its output limit before completing the structured observation.")
+        complete = list(re.finditer(r"[.!?。！？](?=\s|$)", response))
+        if not complete:
+            raise ObservationError("Moondream hit its output limit before completing a description.")
+        response = response[:complete[-1].end()]
+    values = normalize_observation(response)
     return {"timestamp": source_time, "image_bytes": len(image), "image_sha256": digest, **values}
 
 

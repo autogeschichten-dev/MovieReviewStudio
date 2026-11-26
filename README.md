@@ -147,3 +147,9 @@ The Smart Editor defaults to **Adaptive to Narration** when narration parts are 
 **Original audio…** sets defaults for generation, including a 10-second opening and ending, two 12-second intermediate highlights, and an optional fade to black. Use the inspector and source browser to replace or trim groups already on the timeline. A deleted opening or ending stays disabled for the project until explicitly re-enabled. Cinematic cuts require usable source audio and credible source boundaries. If an intermediate cut cannot align to a verified narration pause, move it or choose a different pause.
 
 Deleting or trimming narrated picture leaves an explicit gap so later narration and cuts stay in place. Use **Auto fill gap** or select a source candidate and choose **Replace clip**. Splitting narrated picture retains one source fragment and makes a gap for the other so adjacent fragments of the same source shot cannot be exported. Gaps remain visible and block export. Use the lock icon to protect a clip, Delete with timeline focus, and Ctrl+Z / Ctrl+Y to undo or redo.
+
+### Planning recovery
+
+With the same source, settings, and models, **Retry failed chapter** reads cached observations without starting visual inference. **Resume AI Review** checks those caches first and can analyze additional footage when needed. If timeline validation or writing fails after chapter selection, the validated source ranges and script checkpoint are available for retry. **Open diagnostic report** opens the per-source trace in the application cache. Python tracebacks are also written to `studio.log`.
+
+For shortages of up to five seconds, recovery first looks for an unused portion of an already grounded shot. The retained range contains the observed frame and passes the same overlap, source-gap, and visual-cut checks as the rest of the edit.

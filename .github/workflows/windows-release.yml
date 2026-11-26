@@ -194,6 +194,8 @@ jobs:
             title="Movie Review Studio V3.2.1 — Multi-Part Voice-over Manager"
           elif [[ "$RELEASE_TAG" == "stage3-windows-v3.3.0" ]]; then
             title="Movie Review Studio V3.3.0 — Adaptive Duration and Timeline Editing"
+          elif [[ "$RELEASE_TAG" == "stage3-windows-v3.3.1" ]]; then
+            title="Movie Review Studio V3.3.1 — Planning Recovery Hotfix"
           fi
           gh release create "$RELEASE_TAG" "$ZIP_NAME" \
             --repo "$GITHUB_REPOSITORY" --verify-tag \

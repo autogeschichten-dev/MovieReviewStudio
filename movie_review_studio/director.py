@@ -1,6 +1,8 @@
 """Validated, evidence-linked adapter for Video Recap Skills and a vision provider."""
 from base64 import b64encode
 from collections import defaultdict
+from fractions import Fraction
+from .timing_json import duration_fields
 from dataclasses import asdict, dataclass, replace
 from hashlib import sha256
 from ipaddress import ip_address
@@ -109,10 +111,15 @@ class ScriptSection:
         if not re.fullmatch(r"part-[1-9][0-9]{0,2}", self.id):
             raise ValueError("Invalid narration section identifier.")
 
+    def json_row(self):
+        return {**asdict(self), **duration_fields(self.duration)}
+
     @classmethod
     def restore(cls, row):
+        ratio = row.get("duration_ratio")
+        duration = Fraction(ratio["numerator"], ratio["denominator"]) if ratio else row.get("duration")
         return cls(row["id"], row["text"], tuple(map(tuple, row["evidence"])),
-                   tuple(map(tuple, row.get("alternatives", []))), row.get("duration"))
+                   tuple(map(tuple, row.get("alternatives", []))), duration)
 
 
 def placements(sections, clips, fps):
@@ -145,7 +152,7 @@ def timeline_document(movie, clips, sections=(), audio_files=None):
     return {"schema_version": 3, "canvas": {"width": movie.width, "height": movie.height, "fps": str(fps)},
             "sources": {"movie": str(movie.path)}, "video": rows,
             "meta": {"upstream_commit": UPSTREAM,
-                     "script_sections": [dict(asdict(s), placements=linked[s.id])
+                     "script_sections": [dict(s.json_row(), placements=linked[s.id])
                                          for s in sections]},
             "audio": {"narration": audio_files or []}}
 

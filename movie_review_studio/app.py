@@ -614,7 +614,7 @@ class Studio(QMainWindow):
         source_key = self.source_key
         report_path = self.cache / f"ai-planning-{source_key}.txt"
         self.planning_report = report_path
-        def work(progress, only_cached):
+        def work(progress, only_cached, resume):
             if action != "analyze" and any(clip.locked for clip in self.clips):
                 raise ValueError("Unlock the protected clips before regenerating the whole review.")
             progress("Scene detection · checking movie analysis")
@@ -647,7 +647,7 @@ class Studio(QMainWindow):
 
             def observations(clips, report, *, cache_only=None):
                 nonlocal failed_observations
-                read_only = only_cached or bool(cache_only)
+                read_only = only_cached or bool(cache_only) or (resume and cache_only is None)
                 if cache_only is False and local_planner and not read_only:
                     local_ai.release_model(provider.model)
                 try:
@@ -675,6 +675,8 @@ class Studio(QMainWindow):
                                               transcript=cues, report=report_path, min_gap=min_gap,
                                               expand_live=not only_cached, adaptive=adapt)
             except Exception:
+                from .planning import record_exception
+                record_exception(report_path, "AI review")
                 if local_planner:
                     try:
                         local_ai.release_model(provider.model)
@@ -682,7 +684,10 @@ class Studio(QMainWindow):
                         logging.warning("Could not unload the text model after failure.")
                 raise
             if local_planner:
-                local_ai.release_model(provider.model)
+                try:
+                    local_ai.release_model(provider.model)
+                except RuntimeError:
+                    logging.warning("The completed review was retained after a text model unload error.", exc_info=True)
             return analysis, audio, highlights, clips, script, failed_observations, dialogue_status
 
         def apply(result):
@@ -711,12 +716,17 @@ class Studio(QMainWindow):
             self.analysis_label.setText("Planning paused · completed evidence remains cached")
             self.statusBar().showMessage("AI planning paused. Retry or inspect the diagnostic report.")
 
+        launched = False
+
         def launch(cache_only):
+            nonlocal launched
             if self.source_key != source_key:
                 raise ValueError("This review belongs to a different movie.")
+            resume = launched or action == "resume"
+            launched = True
             self.recovery_panel.hide()
-            self.background("Retrying planning from cached evidence…" if cache_only else "Preparing grounded AI review…",
-                            lambda progress: work(progress, cache_only), apply,
+            self.background("Retrying planning from cached evidence…" if cache_only or resume else "Preparing grounded AI review…",
+                            lambda progress: work(progress, cache_only, resume), apply,
                             on_error=failed if action != "analyze" else None)
 
         if action != "analyze":
@@ -2201,7 +2211,7 @@ class Studio(QMainWindow):
         linked = director.placements(self.script, self.clips, self.movie.fps)
         atomic_json(destination, {
             "version": 4, "duration_mode": self.duration_mode, "cinema": self.cinema_settings,
-            "minimum_source_gap_seconds": self.source_gap.value(), "director": {"sections": [dict(vars(s), placements=linked[s.id]) for s in self.script],
+            "minimum_source_gap_seconds": self.source_gap.value(), "director": {"sections": [dict(s.json_row(), placements=linked[s.id]) for s in self.script],
                                         "approved": self.script_approved, "mode": self.director_mode,
                                         "language": self.director_language, "generated_voice": str(self.generated_voice) if self.generated_voice else None},
             "mix": vars(self.mix), "movie": str(self.movie.path), "source_key": self.source_key,
