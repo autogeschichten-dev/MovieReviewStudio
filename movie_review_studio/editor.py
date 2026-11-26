@@ -154,6 +154,18 @@ class Timeline(QWidget):
                     self.paint_waveforms(painter, event.rect(), self.regions[index],
                                          self.studio.waves[key].peaks, 82 + index * 29,
                                          (ORANGE, BLUE, GREEN)[index])
+            studio = self.studio
+            if studio.voice_sync_valid() and studio.voice_recording:
+                from .narration import markers
+                fps = float(studio.movie.fps)
+                for number, offset in markers(studio.voice_recording, studio.voice_sync["schedule"]):
+                    for start, end, bed_offset, _ in self.regions[1]:
+                        if bed_offset <= offset < bed_offset + (end - start) / fps:
+                            x = round(self.x_at(start + (offset - bed_offset) * fps))
+                            painter.setPen(QColor("#fff1bd"))
+                            painter.drawLine(x, 111, x, 139)
+                            painter.drawText(x + 4, 124, f"P{number:02}")
+                            break
             if self.frame is not None:
                 x = round(self.x_at(self.frame))
                 painter.setPen(QPen(QColor('#f8e499'), 2))

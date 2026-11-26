@@ -4,6 +4,8 @@ from pathlib import Path
 from threading import Event
 import os
 import re
+import shutil
+import tempfile
 from time import monotonic
 import json
 import logging
@@ -23,13 +25,14 @@ from PySide6.QtWidgets import (
 
 from .analysis import analyze, atomic_json, fingerprint_highlight
 from .media import Cancelled, cancellation, identity, inspect, invoke
-from . import director, local_ai
+from . import director, local_ai, narration
 from .ai_settings import AISettingsDialog, model_choices, settings
 from .editor import SceneModel, Timeline, TrackLabels, thumbnail
 from .model import (DEFAULT_SOURCE_GAP, adjacent_conflict, overlaps, replacement, separation_issues,
                     timeline_entries, timeline_validation_report, validate)
 from .render import Mix, render, render_selection
 from .smart import AudioEvidence, LocalWhisper, assemble, audio_evidence, suggest_highlights
+from .voice_manager import VoiceManager
 
 
 class JobSignals(QObject):
@@ -110,6 +113,9 @@ class Studio(QMainWindow):
         self.cache = cache
         self.movie = self.analysis = self.source_key = None
         self.voice = self.music = None
+        self.voice_parts = (None,) * 3
+        self.voice_pause, self.voice_trim, self.voice_fit = 250, True, False
+        self.voice_captions = self.voice_recording = self.voice_sync = self.voice_manager = None
         self.highlights = []
         self.clips = []
         self.montage_playback = False
@@ -263,12 +269,12 @@ class Studio(QMainWindow):
         self.music_label = QLabel("Optional")
         assets = (
             ("Movie", self.movie_label, self.import_movie, None),
-            ("Voice-over", self.voice_label, lambda: self.import_audio("voice"), lambda: self.clear_audio("voice")),
+            ("Voice-over", self.voice_label, self.open_voice_manager, None),
             ("Music", self.music_label, lambda: self.import_audio("music"), lambda: self.clear_audio("music")),
         )
         for name, label, action, clear in assets:
             row = QHBoxLayout()
-            row.addWidget(self.button(f"Import {name.lower()}", action))
+            row.addWidget(self.button("Voice-over Manager…" if name == "Voice-over" else f"Import {name.lower()}", action))
             if clear:
                 row.addWidget(self.button("Clear", clear))
             row.addWidget(label, 1)
@@ -754,6 +760,7 @@ class Studio(QMainWindow):
             self.record_edit()
             self.voice, self.script, self.waves["voice"] = result
             self.generated_voice = self.voice
+            self.voice_sync = None
             self.invalidate_preview()
             self.refresh()
 
@@ -762,6 +769,8 @@ class Studio(QMainWindow):
     def align_script_voice(self):
         if not self.voice or not self.script or not self.script_approved:
             raise ValueError("Import narration and approve the script before transcript alignment.")
+        if self.voice_sync:
+            raise ValueError("Use Merge & Synchronize in Voice-over Manager for imported narration parts.")
         if self.generated_voice == self.voice:
             raise ValueError("Select the original imported recording before aligning again.")
 
@@ -774,6 +783,7 @@ class Studio(QMainWindow):
             self.record_edit()
             self.voice, self.script, self.waves["voice"] = result
             self.generated_voice = self.voice
+            self.voice_sync = None
             self.invalidate_preview()
             self.refresh()
 
@@ -785,8 +795,7 @@ class Studio(QMainWindow):
         path, _ = QFileDialog.getSaveFileName(self, "Export timeline", "timeline.json", "JSON (*.json)")
         if not path:
             return
-        if Path(path).resolve() in {item.resolve() for item in (self.movie.path, self.voice, self.music) if item}:
-            raise ValueError("Save timeline JSON to a different file from the imported media.")
+        self.check_output_path(Path(path))
         atomic_json(Path(path), director.timeline_document(self.movie, self.clips, self.script))
 
     def import_director_timeline(self):
@@ -834,9 +843,11 @@ class Studio(QMainWindow):
             volume.valueChanged.connect(lambda value, name=track: self.set_gain(name, value))
             self.mix_inputs[track] = volume
             row.addWidget(volume)
-            if track != "original":
-                row.addWidget(self.button("Import", lambda name=track: self.import_audio(name)))
-                row.addWidget(self.button("Clear", lambda name=track: self.clear_audio(name)))
+            if track == "voice":
+                row.addWidget(self.button("Manage…", self.open_voice_manager))
+            if track == "music":
+                row.addWidget(self.button("Import", lambda: self.import_audio("music")))
+                row.addWidget(self.button("Clear", lambda: self.clear_audio("music")))
             layout.addLayout(row)
         layout.addStretch(1)
         return self.panel(layout)
@@ -949,6 +960,8 @@ class Studio(QMainWindow):
 
     def background(self, message, operation, on_result, *, on_error=None):
         self.tabs.setEnabled(False)
+        if self.voice_manager:
+            self.voice_manager.setEnabled(False)
         self.progress.show()
         self.cancel_button.show()
         self.cancel_button.setEnabled(True)
@@ -967,6 +980,8 @@ class Studio(QMainWindow):
             left = "ETA estimating" if estimate is None else "ETA " + clock(max(0, estimate - monotonic())).split(".")[0]
             if self.cancel_button.isEnabled():
                 self.statusBar().showMessage(f"{recent}  ·  {elapsed} elapsed  ·  {left}")
+                if self.voice_manager and self.voice_manager.isVisible():
+                    self.voice_manager.summary.setText(f"{recent}  ·  {elapsed} elapsed")
 
         def update_progress(text):
             nonlocal stage, stage_start, recent, estimate
@@ -1000,6 +1015,9 @@ class Studio(QMainWindow):
             timer.stop()
             timer.deleteLater()
             self.tabs.setEnabled(True)
+            if self.voice_manager:
+                self.voice_manager.setEnabled(True)
+                self.voice_manager.update_summary()
             self.progress.hide()
             self.cancel_button.hide()
             self.job = None
@@ -1062,6 +1080,10 @@ class Studio(QMainWindow):
         self.script = []
         self.script_approved = False
         self.drop_generated_voice()
+        if self.voice_sync:
+            self.voice_sync = None
+            self.voice = None
+            self.waves["voice"] = AudioEvidence()
         self.undo_stack.clear()
         self.redo_stack.clear()
         if not self.title.text():
@@ -1071,8 +1093,145 @@ class Studio(QMainWindow):
         self.refresh()
         self.statusBar().showMessage("Movie imported. Choose a target and generate a review.")
 
+    def open_voice_manager(self):
+        if not self.voice_manager:
+            self.voice_manager = VoiceManager(self, clock)
+            self.target.valueChanged.connect(self.voice_manager.update_summary)
+        self.voice_manager.refresh()
+        self.voice_manager.show()
+        self.voice_manager.raise_()
+        self.voice_manager.activateWindow()
+
+    def update_voice_slots(self, parts):
+        self.record_edit()
+        populated = tuple(p for p in parts if p)
+        previous = tuple(p for p in self.voice_parts if p)
+        self.voice_parts = parts + (None,) * max(0, 3 - len(parts))
+        if populated != previous:
+            self.reset_managed_voice()
+        self.refresh()
+
+    def reset_managed_voice(self):
+        self.voice_recording = self.voice_sync = None
+        self.voice = self.generated_voice = None
+        self.waves["voice"] = AudioEvidence()
+        self.invalidate_preview()
+
+    def voice_options(self, pause, trim, fit, captions):
+        captions = self.voice_captions if captions is ... else captions
+        if (pause, trim, fit, captions) == (self.voice_pause, self.voice_trim, self.voice_fit, self.voice_captions):
+            return
+        self.record_edit()
+        if (pause, trim, captions) != (self.voice_pause, self.voice_trim, self.voice_captions) and self.voice_sync:
+            self.reset_managed_voice()
+        if (pause, trim) != (self.voice_pause, self.voice_trim):
+            self.voice_recording = None
+        self.voice_pause, self.voice_trim, self.voice_fit, self.voice_captions = pause, trim, fit, captions
+        self.refresh()
+
+    def load_voice_parts(self, index, paths):
+        def load(progress):
+            return [narration.read_part(path, self.cache, progress) for path in paths]
+
+        def apply(items):
+            parts = list(self.voice_parts)
+            stop = index + 1
+            while stop < min(len(parts), index + len(items)) and parts[stop] is None:
+                stop += 1
+            parts[index:stop] = items
+            self.update_voice_slots(tuple(parts))
+
+        self.background("Importing narration…", load, apply)
+
+    def voice_edit_stamp(self, clips=None, script=None):
+        clips = self.clips if clips is None else clips
+        script = self.script if script is None else script
+        return [self.source_key, [[c.start, c.end, c.movie_audio] for c in clips],
+                [[s.id, s.text, [[a, b] for a, b, _ in s.evidence]] for s in script]]
+
+    def voice_sync_valid(self):
+        return bool(self.voice_sync and self.voice and self.voice_sync["stamp"] == self.voice_edit_stamp())
+
+    def fitted_narration(self):
+        return self.voice_sync_valid() and self.voice_sync["fit"]
+
+    def check_managed_narration(self, final=False):
+        if self.voice_sync and not self.voice_sync_valid():
+            raise ValueError("The edit changed. Run Voice-over Manager → Merge & Synchronize before playback or export.")
+        if final and any(self.voice_parts) and not self.voice:
+            raise ValueError("Run Voice-over Manager → Merge & Synchronize before export.")
+
+    def process_voice(self, action, play=None, *, destination=None):
+        parts = tuple(part for part in self.voice_parts if part)
+        if not parts:
+            raise ValueError("Import at least one narration part.")
+        if action == "sync":
+            self.require_movie(True)
+            if not self.clips:
+                raise ValueError("Generate or edit a montage before synchronizing narration.")
+        pause, trim, fit, captions = self.voice_pause, self.voice_trim, self.voice_fit, self.voice_captions
+        clips, script, movie, analysis, gap = self.clips[:], self.script[:], self.movie, self.analysis, self.source_gap.value()
+
+        def work(progress):
+            recording = narration.merge(parts, pause, trim, self.cache, progress)
+            if action == "preview":
+                return recording, recording.path
+            if action == "export":
+                with tempfile.TemporaryDirectory(prefix="mrs-voice-export-", dir=destination.parent) as folder:
+                    output = Path(folder) / destination.name
+                    if destination.suffix.lower() == ".wav":
+                        shutil.copyfile(recording.path, output)
+                    else:
+                        from .media import ffmpeg
+                        ffmpeg("-i", str(recording.path), "-c:a", "libmp3lame", "-q:a", "2", str(output))
+                    output.replace(destination)
+                return recording, destination
+            try:
+                cues = narration.transcript(recording, parts, captions, self.cache, progress) if script else []
+                picture, sections, schedule, length, aligned = narration.synchronize(
+                    recording, clips, script, cues, movie, analysis, gap, fit, progress)
+                bed = narration.materialize(recording, schedule, length, self.cache)
+                evidence = audio_evidence(bed, self.cache, progress)
+            except (OSError, RuntimeError, ValueError) as error:
+                return recording, str(error)
+            return recording, (picture, sections, bed, evidence, {
+                "stamp": self.voice_edit_stamp(picture, sections), "schedule": schedule,
+                "length": length, "aligned": aligned, "fit": fit,
+                "identities": [part.stamp for part in parts],
+            })
+
+        def apply(result):
+            recording = result[0]
+            if action == "sync":
+                if isinstance(result[1], str):
+                    self.voice_recording = recording
+                    if self.voice_manager:
+                        self.voice_manager.update_summary()
+                    self.error(result[1])
+                    return
+                self.record_edit()
+                self.voice_recording = recording
+                self.clips, self.script, self.voice, self.waves["voice"], self.voice_sync = result[1]
+                self.generated_voice = None
+                self.invalidate_preview()
+                self.refresh()
+                self.statusBar().showMessage("Narration synchronized. Imported parts are marked on the Narration track.")
+            else:
+                self.voice_recording = recording
+                if self.voice_manager:
+                    self.voice_manager.update_summary()
+                if play:
+                    play(result[1])
+                else:
+                    self.statusBar().showMessage(f"Exported narration to {result[1]}")
+
+        self.background("Processing narration…", work, apply)
+
     def import_audio(self, track):
-        formats = "Audio (*.mp3 *.wav)" if track == "voice" else "Audio (*.mp3 *.wav *.aac *.m4a *.flac *.ogg)"
+        if track == "voice":
+            self.open_voice_manager()
+            return
+        formats = "Audio (*.mp3 *.wav *.aac *.m4a *.flac *.ogg)"
         path, _ = QFileDialog.getOpenFileName(self, f"Import {track}", "", formats)
         if path:
             def load(progress):
@@ -1090,6 +1249,9 @@ class Studio(QMainWindow):
 
     def clear_audio(self, track):
         self.record_edit()
+        if track == "voice":
+            self.voice_parts = (None,) * 3
+            self.reset_managed_voice()
         setattr(self, track, None)
         self.waves[track] = AudioEvidence()
         self.invalidate_preview()
@@ -1248,7 +1410,9 @@ class Studio(QMainWindow):
 
     def snapshot(self):
         return (self.clips[:], self.highlights[:], self.mix, self.voice, self.music, self.waves.copy(),
-                self.script[:], self.script_approved, self.director_language, self.director_mode, self.generated_voice)
+                self.script[:], self.script_approved, self.director_language, self.director_mode, self.generated_voice,
+                self.voice_parts, self.voice_pause, self.voice_trim, self.voice_fit, self.voice_captions,
+                self.voice_recording, self.voice_sync)
 
     def record_edit(self):
         self.undo_stack.append(self.snapshot())
@@ -1258,7 +1422,9 @@ class Studio(QMainWindow):
         if source:
             destination.append(self.snapshot())
             (self.clips, self.highlights, self.mix, self.voice, self.music, waves, self.script,
-             self.script_approved, self.director_language, self.director_mode, self.generated_voice) = source.pop()
+             self.script_approved, self.director_language, self.director_mode, self.generated_voice,
+             self.voice_parts, self.voice_pause, self.voice_trim, self.voice_fit, self.voice_captions,
+             self.voice_recording, self.voice_sync) = source.pop()
             self.waves.update({key: waves[key] for key in ("voice", "music")})
             self.sync_mix()
             self.invalidate_preview()
@@ -1349,7 +1515,7 @@ class Studio(QMainWindow):
         # Earlier edits can remain previewable and be repaired incrementally.
         enforce = final or not (preview or
             separation_issues(clips, fps, gap).keys() <= separation_issues(self.clips, fps, gap).keys())
-        validate(clips, fps, self.analysis.frames, final=final, has_audio=self.movie.has_audio,
+        validate(clips, fps, self.analysis.frames, final=final and not self.fitted_narration(), has_audio=self.movie.has_audio,
                  min_gap=gap, enforce_separation=enforce)
 
     def selected_row(self):
@@ -1362,8 +1528,10 @@ class Studio(QMainWindow):
         self.require_movie(True)
         row = self.selected_row()
         entry = self.entries[row]
+        self.check_managed_narration()
         self.background("Preparing selected clip…", lambda progress: render_selection(
-            self.movie, self.analysis, self.clips, row, self.voice, self.music, self.cache, progress, mix=self.mix),
+            self.movie, self.analysis, self.clips, row, self.voice, self.music, self.cache, progress, mix=self.mix,
+            managed_voice=self.voice_sync_valid()),
             lambda path: self.load_player(path, f"Selected clip {row + 1}", montage=True, entry=entry))
 
     def select_edit(self, index):
@@ -1502,11 +1670,14 @@ class Studio(QMainWindow):
     def preview(self, clips, *, assembly=False):
         self.require_movie(True)
         self.check(clips, preview=True)
+        if assembly:
+            self.check_managed_narration()
         voice = self.voice if assembly else None
         music = self.music if assembly else None
         label = "Montage preview" if assembly else "Source range preview"
         self.background("Preparing preview…", lambda progress: render(self.movie, self.analysis, clips, voice,
-                        music, self.cache, progress, mix=self.mix if assembly else None), lambda path: self.load_player(
+                        music, self.cache, progress, mix=self.mix if assembly else None,
+                        managed_voice=assembly and self.voice_sync_valid()), lambda path: self.load_player(
                         path, label, montage=assembly))
 
     def load_player(self, path, label, *, source=False, montage=False, entry=None, position=0, autoplay=True, muted=False):
@@ -1691,7 +1862,12 @@ class Studio(QMainWindow):
         self.movie_label.setText(f"{movie.path.name}\n{movie.width} × {movie.height} · {float(movie.fps):.3f} FPS · {clock(movie.duration)}"
                                  if movie else "No movie imported")
         self.refresh_title()
-        self.voice_label.setText(self.voice.name if self.voice else "Optional")
+        part_count = sum(part is not None for part in self.voice_parts)
+        state = "synced" if self.voice_sync_valid() else "ready to merge"
+        self.voice_label.setText(f"{part_count} audio parts · {state}" if part_count else
+                                 self.voice.name if self.voice else "Optional")
+        if self.voice_manager:
+            self.voice_manager.refresh()
         self.music_label.setText(self.music.name if self.music else "Optional")
         self.analysis_label.setText(f"{len(self.analysis.candidates):,} usable candidates"
                                     if self.analysis else "Waiting for analysis")
@@ -1729,8 +1905,7 @@ class Studio(QMainWindow):
         if not path:
             return
         destination = Path(path)
-        if destination.resolve() in {item.resolve() for item in (self.movie.path, self.voice, self.music) if item}:
-            raise ValueError("Save the edit to a different file from the imported media.")
+        self.check_output_path(destination)
         linked = director.placements(self.script, self.clips, self.movie.fps)
         atomic_json(destination, {
             "version": 4, "minimum_source_gap_seconds": self.source_gap.value(), "director": {"sections": [dict(vars(s), placements=linked[s.id]) for s in self.script],
@@ -1738,6 +1913,10 @@ class Studio(QMainWindow):
                                         "language": self.director_language, "generated_voice": str(self.generated_voice) if self.generated_voice else None},
             "mix": vars(self.mix), "movie": str(self.movie.path), "source_key": self.source_key,
             "voice": str(self.voice) if self.voice else None, "music": str(self.music) if self.music else None,
+            "voice_manager": {"parts": [str(part.path) if part else None for part in self.voice_parts],
+                              "pause": self.voice_pause, "trim": self.voice_trim, "fit": self.voice_fit,
+                              "captions": str(self.voice_captions) if self.voice_captions else None,
+                              "sync": self.voice_sync},
             "title": self.title.text(), "year": self.year.value(), "target": self.target.value(),
             "highlights": [[c.start, c.end, list(c.cuts), c.muted, c.role] for c in self.highlights],
             "clips": [[c.start, c.end, c.highlight, c.original, c.role] for c in self.clips],
@@ -1779,6 +1958,22 @@ class Studio(QMainWindow):
             if len(ordered) > 3 or any(a.end > b.start for a, b in zip(ordered, ordered[1:])):
                 raise ValueError("The saved highlights overlap or exceed the limit of three.")
             tracks = [Path(payload[name]) if payload[name] else None for name in ("voice", "music")]
+            manager = payload.get("voice_manager", {})
+            paths = manager.get("parts", [])
+            legacy_voice = tracks[0] if not payload.get("director", {}).get("generated_voice") else None
+            if not any(paths) and legacy_voice and legacy_voice.suffix.lower() in {".wav", ".mp3"} and not manager.get("sync"):
+                paths = [str(legacy_voice)]
+            parts = tuple(narration.read_part(Path(part), self.cache, progress) if part else None for part in paths)
+            recording = None
+            sync = manager.get("sync")
+            if sync:
+                imported = tuple(part for part in parts if part)
+                if [identity(part.path) for part in imported] == sync["identities"]:
+                    recording = narration.merge(imported, manager["pause"], manager["trim"], self.cache, progress)
+                    tracks[0] = narration.materialize(recording, sync["schedule"], sync["length"], self.cache)
+                else:
+                    manager = dict(manager, sync=None)
+                    tracks[0] = None
             for track in tracks:
                 if track:
                     inspect(track, video=False)
@@ -1788,10 +1983,17 @@ class Studio(QMainWindow):
                 waves["original"] = audio_evidence(movie.path, self.cache, progress, movie=True) if movie.has_audio else AudioEvidence()
             except (OSError, ValueError, RuntimeError):
                 waves["original"] = AudioEvidence()
-            return payload, movie, analysis, highlights, clips, tracks, waves
+            return payload, movie, analysis, highlights, clips, tracks, waves, manager, parts, recording
 
         def apply(result):
-            payload, self.movie, self.analysis, self.highlights, self.clips, tracks, self.waves = result
+            (payload, self.movie, self.analysis, self.highlights, self.clips, tracks, self.waves,
+             manager, parts, self.voice_recording) = result
+            self.voice_parts = parts + (None,) * max(0, 3 - len(parts))
+            self.voice_pause = manager.get("pause", 250)
+            self.voice_trim = manager.get("trim", True)
+            self.voice_fit = manager.get("fit", False)
+            self.voice_captions = Path(manager["captions"]) if manager.get("captions") else None
+            self.voice_sync = manager.get("sync")
             self.source_gap.blockSignals(True)
             self.source_gap.setValue(payload.get("minimum_source_gap_seconds", DEFAULT_SOURCE_GAP))
             self.source_gap.blockSignals(False)
@@ -1840,7 +2042,8 @@ class Studio(QMainWindow):
 
     def validation_report(self):
         return timeline_validation_report(self.clips, self.movie.fps, self.analysis.frames,
-                                          has_audio=self.movie.has_audio, min_gap=self.source_gap.value())
+                                          has_audio=self.movie.has_audio, min_gap=self.source_gap.value(),
+                                          fitted_duration=self.fitted_narration())
 
     def save_timeline_report(self):
         self.require_movie(True)
@@ -1853,11 +2056,14 @@ class Studio(QMainWindow):
             self.statusBar().showMessage(f"Saved timeline validation report to {destination}")
 
     def check_output_path(self, destination):
-        if destination.resolve() in {item.resolve() for item in (self.movie.path, self.voice, self.music) if item}:
+        protected = [self.movie.path if self.movie else None, self.voice, self.music, self.voice_captions,
+                     *(part.path for part in self.voice_parts if part)]
+        if destination.resolve() in {item.resolve() for item in protected if item}:
             raise ValueError("Choose a different output path from the imported media.")
 
     def export(self):
         self.require_movie(True)
+        self.check_managed_narration(final=True)
         self.check(self.clips, final=True)
         path, _ = QFileDialog.getSaveFileName(self, "Export review", "Movie Review.mp4", "MP4 video (*.mp4)")
         if not path:
@@ -1866,6 +2072,7 @@ class Studio(QMainWindow):
         if destination.suffix.lower() != ".mp4":
             raise ValueError("Choose an .mp4 export filename.")
         report_path = destination.with_suffix(".timeline-validation.json")
+        self.check_output_path(destination)
         self.check_output_path(report_path)
         report = self.validation_report()
         min_gap = report["minimum_source_gap_seconds"]
@@ -1873,7 +2080,8 @@ class Studio(QMainWindow):
 
         def work(progress):
             output = render(self.movie, self.analysis, self.clips, self.voice, self.music, self.cache, progress,
-                            destination=destination, mix=self.mix, min_gap=min_gap)
+                            destination=destination, mix=self.mix, min_gap=min_gap,
+                            managed_voice=self.voice_sync_valid(), fitted_duration=self.fitted_narration())
             atomic_json(report_path, report)
             return output
 

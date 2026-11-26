@@ -191,7 +191,8 @@ def separation_issues(clips, fps, min_gap=DEFAULT_SOURCE_GAP):
     return issues
 
 
-def timeline_validation_report(clips, fps, source_frames, *, has_audio=True, min_gap=DEFAULT_SOURCE_GAP):
+def timeline_validation_report(clips, fps, source_frames, *, has_audio=True, min_gap=DEFAULT_SOURCE_GAP,
+                               fitted_duration=False):
     entries = timeline_entries(clips, fps)
     cuts = []
     for index, (left, right) in enumerate(zip(clips, clips[1:]), 1):
@@ -199,7 +200,7 @@ def timeline_validation_report(clips, fps, source_frames, *, has_audio=True, min
         cuts.append({"left_edit": index, "right_edit": index + 1,
                      "source_gap_seconds": float(source_gap(left, right) / fps), "issue": issue})
     try:
-        validate(clips, fps, source_frames, final=True, has_audio=has_audio, min_gap=min_gap)
+        validate(clips, fps, source_frames, final=not fitted_duration, has_audio=has_audio, min_gap=min_gap)
     except ValueError as error:
         failure = str(error)
     else:
@@ -214,6 +215,7 @@ def timeline_validation_report(clips, fps, source_frames, *, has_audio=True, min
                 overlapping.append([index, other_index])
     return {"passed": failure is None, "overlapping_edits": overlapping, "first_error": failure, "source_fps": str(fps),
             "minimum_source_gap_seconds": min_gap, "maximum_fragment_seconds": MAX_CLIP_SECONDS,
+            "duration_fitted_to_narration": fitted_duration,
             "duration_seconds": float(sum(clip.frames for clip in clips) / fps), "cuts": cuts,
             "fragments": [{"edit": entry.edit_index + 1, "source_start_frame": entry.segment.start,
                            "source_end_frame": entry.segment.end, "timeline_start_frame": entry.position,

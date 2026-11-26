@@ -62,7 +62,7 @@ def audio_spans(clips: list[Clip]) -> list[tuple[bool, int, int]]:
     return spans
 
 
-def audio_track(movie: Media, clips: list[Clip], voice: Path | None, music: Path | None, folder: Path, mix: Mix | None = None, progress=lambda _: None) -> Path:
+def audio_track(movie: Media, clips: list[Clip], voice: Path | None, music: Path | None, folder: Path, mix: Mix | None = None, progress=lambda _: None, *, managed_voice=False) -> Path:
     def samples(frame):
         return round(frame * RATE / movie.fps)
 
@@ -80,6 +80,10 @@ def audio_track(movie: Media, clips: list[Clip], voice: Path | None, music: Path
     bed_cursor = 0
     output = folder / "audio.wav"
     spans = audio_spans(clips)
+    if managed_voice:
+        required = sum(samples(end) - samples(start) for original, start, end in spans if not original)
+        if "voice" not in inputs or inputs["voice"][1] != required:
+            raise ValueError("The synchronized narration does not match this edit. Run Merge & Synchronize again.")
     with wave.open(str(output), "wb") as result:
         result.setparams((2, 2, RATE, 0, "NONE", "not compressed"))
         for index, (highlight, start, end) in enumerate(spans):
@@ -120,6 +124,8 @@ def audio_track(movie: Media, clips: list[Clip], voice: Path | None, music: Path
                     args += ["-ss", seconds(Fraction(offset, RATE)), "-i", str(path)]
                     fade_ins = f",afade=t=in:ss=0:ns={fade}" if index else ""
                     fade_outs = f",afade=t=out:ss={count - fade}:ns={fade}" if index < len(spans) - 1 else ""
+                    if name == "voice" and managed_voice:
+                        fade_ins = fade_outs = ""
                     gain = "0.92" if name == "voice" else "0.16"
                     if mix:
                         gain = mix.voice if name == "voice" else mix.music
@@ -151,9 +157,9 @@ def preview_chunk(cache: Path, source_key: str, clip: Clip) -> Path:
 
 
 def render_selection(movie: Media, analysis: Analysis, clips: list[Clip], row: int,
-                     voice: Path | None, music: Path | None, cache: Path, progress, *, mix: Mix | None = None) -> Path:
+                     voice: Path | None, music: Path | None, cache: Path, progress, *, mix: Mix | None = None, managed_voice=False) -> Path:
     entry = timeline_entries(clips, movie.fps)[row]
-    assembly = render(movie, analysis, clips, voice, music, cache, progress, mix=mix)
+    assembly = render(movie, analysis, clips, voice, music, cache, progress, mix=mix, managed_voice=managed_voice)
     destination = cache / f"{assembly.stem}-clip-{row + 1}.mp4"
     if destination.is_file():
         return destination
@@ -176,14 +182,16 @@ def render_selection(movie: Media, analysis: Analysis, clips: list[Clip], row: i
 
 def render(movie: Media, analysis: Analysis, clips: list[Clip], voice: Path | None,
            music: Path | None, cache: Path, progress, *, destination: Path | None = None, mix: Mix | None = None,
-           min_gap=DEFAULT_SOURCE_GAP) -> Path:
+           min_gap=DEFAULT_SOURCE_GAP, managed_voice=False, fitted_duration=False) -> Path:
     preview = destination is None
-    validate(clips, movie.fps, analysis.frames, final=not preview, has_audio=movie.has_audio,
+    validate(clips, movie.fps, analysis.frames, final=not preview and not fitted_duration, has_audio=movie.has_audio,
              min_gap=min_gap, enforce_separation=not preview)
     entries = timeline_entries(clips, movie.fps)
     identities = [identity(path) if path else None for path in (movie.path, voice, music)]
     key_data = (VERSION, identities, [(c.start, c.end, c.highlight, c.cuts, c.original, c.muted) for c in clips],
                 (mix.original, mix.voice, mix.music) if mix else None)
+    if managed_voice:
+        key_data += ("managed-narration",)
     key = hashlib.sha256(json.dumps(key_data).encode()).hexdigest()
     destination = destination or cache / f"preview-{key}.mp4"
     if destination.resolve() in {path.resolve() for path in (movie.path, voice, music) if path}:
@@ -215,7 +223,7 @@ def render(movie: Media, analysis: Analysis, clips: list[Clip], voice: Path | No
         concat = folder / "clips.ffconcat"
         concat.write_text("\n".join(listing) + "\n", encoding="ascii")
         progress("Mixing narration, music and original-audio highlights…")
-        audio = audio_track(movie, clips, voice, music, folder, mix, progress)
+        audio = audio_track(movie, clips, voice, music, folder, mix, progress, managed_voice=managed_voice)
         intermediate = folder / "result.mp4"
         ffmpeg("-f", "concat", "-safe", "1", "-i", str(concat), "-i", str(audio),
                "-map", "0:v:0", "-map", "1:a:0", "-c:v", "copy", "-c:a", "aac", "-b:a", "256k",
