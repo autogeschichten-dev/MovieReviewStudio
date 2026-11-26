@@ -1264,7 +1264,7 @@ class Studio(QMainWindow):
         if final and any(self.voice_parts) and not self.voice:
             raise ValueError("Run Voice-over Manager → Merge & Synchronize before export.")
 
-    def process_voice(self, action, play=None, *, destination=None):
+    def process_voice(self, action, play=None, *, destination=None, record=True):
         parts = tuple(part for part in self.voice_parts if part)
         if not parts:
             raise ValueError("Import at least one narration part.")
@@ -1291,10 +1291,18 @@ class Studio(QMainWindow):
                     output.replace(destination)
                 return recording, destination
             try:
-                cues = narration.transcript(recording, parts, captions, self.cache, progress) if script else []
+                notices = []
+                cues = []
+                if script or adapt and any(c.movie_audio and c.role not in {"Opening", "Ending"} for c in clips):
+                    try:
+                        cues = narration.transcript(recording, parts, captions, self.cache, progress)
+                    except (OSError, RuntimeError, ValueError):
+                        if not adapt:
+                            raise
+                        notices.append("Narration timing cues were unavailable. Verified waveform pauses were used.")
                 if adapt:
                     picture, sections, schedule, length, aligned = adaptive.fit_recording(
-                        recording, clips, movie, analysis, self.cache, gap, progress, script=script, cues=cues)
+                        recording, clips, movie, analysis, self.cache, gap, progress, script=script, cues=cues, notices=notices)
                 else:
                     picture, sections, schedule, length, aligned = narration.synchronize(
                         recording, clips, script, cues, movie, analysis, gap, fit, progress)
@@ -1304,7 +1312,7 @@ class Studio(QMainWindow):
                 return recording, str(error)
             return recording, (picture, sections, bed, evidence, {
                 "stamp": self.voice_edit_stamp(picture, sections), "schedule": schedule,
-                "length": length, "aligned": aligned, "fit": fit or adapt, "adaptive": adapt,
+                "length": length, "aligned": aligned, "fit": fit or adapt, "adaptive": adapt, "notices": notices,
                 "identities": [part.stamp for part in parts],
             })
 
@@ -1317,13 +1325,18 @@ class Studio(QMainWindow):
                         self.voice_manager.update_summary()
                     self.error(result[1])
                     return
-                self.record_edit()
+                if record:
+                    self.record_edit()
                 self.voice_recording = recording
                 self.clips, self.script, self.voice, self.waves["voice"], self.voice_sync = result[1]
                 self.generated_voice = None
+                if self.voice_sync["adaptive"]:
+                    self.highlights = [clip for clip in self.highlights if clip not in clips or clip in self.clips]
                 self.invalidate_preview()
                 self.refresh()
-                self.statusBar().showMessage("Narration synchronized. Imported parts are marked on the Narration track.")
+                notices = self.voice_sync.get("notices", [])
+                self.statusBar().showMessage(" ".join(notices) or
+                                             "Narration synchronized. Imported parts are marked on the Narration track.")
             else:
                 self.voice_recording = recording
                 if self.voice_manager:
@@ -1903,15 +1916,20 @@ class Studio(QMainWindow):
             raise ValueError("Unlock this clip before deleting it.")
         resync = clip.movie_audio and self.voice_sync_valid()
         edits = [item for item in self.clips if item != clip]
+        if clip.movie_audio and clip in self.clips:
+            edits = adaptive.join_removed_cut(edits, self.clips.index(clip), self.movie, self.analysis, self.cache)
         if edits:
             self.check(edits)
         self.record_edit()
         self.highlights = [item for item in self.highlights if item != clip]
         if clip.role in {"Opening", "Ending"}:
             self.cinema_settings = dict(self.cinema_settings, **{f"disable_{clip.role}": True})
+        elif clip.highlight:
+            count = sum(c.role not in {"Opening", "Ending"} for c in self.highlights)
+            self.cinema_settings = dict(self.cinema_settings, count=min(count, self.cinema_settings["count"]))
         self.set_clips(edits, record=False)
         if resync and edits:
-            self.process_voice("sync")
+            self.process_voice("sync", record=False)
 
     def preview_source(self):
         self.require_movie()
@@ -2308,7 +2326,7 @@ class Studio(QMainWindow):
         def apply(result):
             (payload, self.movie, self.analysis, self.highlights, self.clips, tracks, self.waves,
              manager, parts, self.voice_recording) = result
-            self.duration_mode = payload.get("duration_mode", "fixed")
+            self.duration_mode = payload.get("duration_mode", "auto")
             self.cinema_settings = payload.get("cinema", {"opening": 10, "count": 2, "length": 12, "ending": 10})
             self.voice_parts = parts + (None,) * max(0, 3 - len(parts))
             self.voice_pause = manager.get("pause", 250)

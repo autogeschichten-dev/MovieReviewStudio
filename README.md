@@ -153,3 +153,9 @@ Deleting or trimming narrated picture leaves an explicit gap so later narration 
 With the same source, settings, and models, **Retry failed chapter** reads cached observations without starting visual inference. **Resume AI Review** checks those caches first and can analyze additional footage when needed. If timeline validation or writing fails after chapter selection, the validated source ranges and script checkpoint are available for retry. **Open diagnostic report** opens the per-source trace in the application cache. Python tracebacks are also written to `studio.log`.
 
 For shortages of up to five seconds, recovery first looks for an unused portion of an already grounded shot. The retained range contains the observed frame and passes the same overlap, source-gap, and visual-cut checks as the rest of the edit.
+
+### Narration-first highlight timing
+
+In Adaptive to Narration, **Merge & Synchronize** sizes the picture to the processed recording first. It looks for verified quiet frames near each intermediate original-audio cut and also considers pauses between imported parts. Timestamped narration cues, when available, exclude frames inside speech. Opening and ending audio remain outside the narration. An unlocked intermediate highlight with no compatible pause is skipped with a message. Undo restores the earlier timeline. Locked cuts stay protected.
+
+If the picture is too short, synchronization can add unused cached alternatives approved by the existing script. Without a linked script it can extend the existing source order with eligible cached scenes. Every resulting cut is validated before the edit is applied.

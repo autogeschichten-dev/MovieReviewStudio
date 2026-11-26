@@ -220,9 +220,16 @@ class VoiceManager(QDialog):
         difference = duration - target
         lines = [
             f"Total narration {self.clock(duration)}{' (estimate before processing)' if parts and not recording else ''}",
-            f"Target video {self.clock(target)}",
-            f"Difference {'+' if difference >= 0 else '−'}{self.clock(abs(difference))}",
         ]
+        if studio.adaptive_duration():
+            from .adaptive import duration_totals
+            _, opening, middle, ending, _ = duration_totals(recording, studio.clips, studio.movie.fps if studio.movie else 1)
+            lines.extend(("Adaptive to Narration", f"Opening {self.clock(opening)}",
+                          f"Highlights {self.clock(middle)}", f"Ending {self.clock(ending)}",
+                          f"Calculated final {self.clock(duration + opening + middle + ending)}"))
+        else:
+            lines.extend(("Fixed Duration", f"Target video {self.clock(target)}",
+                          f"Difference {'+' if difference >= 0 else '−'}{self.clock(abs(difference))}"))
         if studio.movie and studio.clips:
             available = sum(c.frames for c in studio.clips if not c.movie_audio) / studio.movie.fps
             picture = sum(c.frames for c in studio.clips) / studio.movie.fps
@@ -230,5 +237,7 @@ class VoiceManager(QDialog):
         if studio.voice_sync and not studio.voice_sync_valid():
             lines.append("The timeline changed. Run Merge & Synchronize again.")
         if studio.voice_sync and studio.voice_sync_valid():
-            lines.append("Script timing matched" if studio.voice_sync["aligned"] else "Synced to existing cuts using audio pauses")
+            lines.append("Script timing matched" if studio.voice_sync["aligned"] else "Synchronized using verified audio pauses")
+        if studio.voice_sync and studio.voice_sync_valid():
+            lines.extend(studio.voice_sync.get("notices", []))
         self.summary.setText("   ·   ".join(lines))

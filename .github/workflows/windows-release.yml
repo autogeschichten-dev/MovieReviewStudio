@@ -196,6 +196,8 @@ jobs:
             title="Movie Review Studio V3.3.0 — Adaptive Duration and Timeline Editing"
           elif [[ "$RELEASE_TAG" == "stage3-windows-v3.3.1" ]]; then
             title="Movie Review Studio V3.3.1 — Planning Recovery Hotfix"
+          elif [[ "$RELEASE_TAG" == "stage3-windows-v3.3.2" ]]; then
+            title="Movie Review Studio V3.3.2 — Narration-First Synchronization"
           fi
           gh release create "$RELEASE_TAG" "$ZIP_NAME" \
             --repo "$GITHUB_REPOSITORY" --verify-tag \
