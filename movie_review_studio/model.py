@@ -32,6 +32,8 @@ class Clip:
     production_card: bool = False
     muted: bool = False
     role: str = ""
+    locked: bool = False
+    gap: bool = False
 
     @property
     def movie_audio(self):
@@ -108,6 +110,8 @@ def source_gap(left: Clip, right: Clip) -> int:
 
 
 def cut_issue(left: Clip, right: Clip, fps=None, min_gap=DEFAULT_SOURCE_GAP):
+    if left.gap or right.gap:
+        return None
     if left.shot is not None and left.shot == right.shot:
         return "continuous_source"
     if any(similar(a, b) for a in left.last for b in right.first) or any(
@@ -150,6 +154,7 @@ def validate(clips: list[Clip], fps: Fraction, source_frames: int, *,
     if not clips:
         raise ValueError("The timeline is empty.")
     highlights = 0
+    roles = set()
     for index, clip in enumerate(clips):
         number = index + 1
         if not 0 <= clip.start < clip.end <= source_frames:
@@ -157,10 +162,19 @@ def validate(clips: list[Clip], fps: Fraction, source_frames: int, *,
         duration = clip.frames / fps
         if clip.movie_audio and not has_audio:
             raise ValueError(f"Clip {number} needs movie audio.")
+        if clip.gap and final:
+            raise ValueError("Fill unresolved picture gaps before export.")
         if clip.highlight:
-            highlights += 1
-            if not has_audio or not 10 <= duration <= 15:
-                raise ValueError(f"Highlight {number} needs movie audio and a length of 10–15 seconds.")
+            cinematic = clip.role in {"Opening", "Ending"}
+            if cinematic:
+                if clip.role in roles or index != (0 if clip.role == "Opening" else len(clips) - 1):
+                    raise ValueError(f"The {clip.role.lower()} must stay at its end of the timeline.")
+                roles.add(clip.role)
+            else:
+                highlights += 1
+            low, high = (1, 30) if cinematic else (1, 15) if clip.role == "Highlight" else (10, 15)
+            if not has_audio or not low <= duration <= high:
+                raise ValueError(f"Highlight {number} needs movie audio and a length of {low}–{high} seconds.")
             parts = video_segments(clip, fps)
             if any(not 0 < part.frames / fps <= MAX_CLIP_SECONDS for part in parts):
                 raise ValueError(f"Highlight {number} has an invalid segment. Each segment must be at most 5 seconds.")
@@ -170,7 +184,7 @@ def validate(clips: list[Clip], fps: Fraction, source_frames: int, *,
             issue = cut_issue(clips[index - 1], clip, fps if enforce_separation else None, min_gap)
             if issue:
                 raise ValueError(f"Clips {index} and {number} {CUT_MESSAGES[issue]}.")
-    ordered = sorted(enumerate(clips, 1), key=lambda item: item[1].start)
+    ordered = sorted(((i, c) for i, c in enumerate(clips, 1) if not c.gap), key=lambda item: item[1].start)
     for (a, left), (b, right) in zip(ordered, ordered[1:]):
         if overlaps(left, right):
             raise ValueError(f"Clips {a} and {b} overlap or reuse the same source frames.")
@@ -184,6 +198,8 @@ def separation_issues(clips, fps, min_gap=DEFAULT_SOURCE_GAP):
     """Key violations by source ranges, so old edits can be repaired one cut at a time."""
     issues = {}
     for left, right in zip(clips, clips[1:]):
+        if left.gap or right.gap:
+            continue
         gap = source_gap(left, right)
         if gap == 0 or 0 < gap / fps < min_gap:
             issues[(left.start, left.end, right.start, right.end)] = (
@@ -200,12 +216,14 @@ def timeline_validation_report(clips, fps, source_frames, *, has_audio=True, min
         cuts.append({"left_edit": index, "right_edit": index + 1,
                      "source_gap_seconds": float(source_gap(left, right) / fps), "issue": issue})
     try:
+        if any(c.gap for c in clips):
+            raise ValueError("Fill unresolved picture gaps before export.")
         validate(clips, fps, source_frames, final=not fitted_duration, has_audio=has_audio, min_gap=min_gap)
     except ValueError as error:
         failure = str(error)
     else:
         failure = None
-    ordered = sorted(enumerate(clips, 1), key=lambda item: item[1].start)
+    ordered = sorted(((i, c) for i, c in enumerate(clips, 1) if not c.gap), key=lambda item: item[1].start)
     overlapping = []
     for offset, (index, clip) in enumerate(ordered):
         for other_index, other in ordered[offset + 1:]:

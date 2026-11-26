@@ -19,7 +19,8 @@ permissions:
 env:
   ZIP_NAME: MovieReviewStudio-Windows-x64.zip
   RELEASE_TAG: ${{ inputs.release_tag || github.ref_name }}
-  REUSE_WINDOWS_MEDIA: ${{ startsWith(inputs.release_tag || github.ref_name, 'stage3-windows-v3.0.') || startsWith(inputs.release_tag || github.ref_name, 'stage3-windows-v3.1.') }}
+  REUSE_WINDOWS_MEDIA: ${{ startsWith(inputs.release_tag || github.ref_name, 'stage3-windows-v3.0.') || startsWith(inputs.release_tag || github.ref_name, 'stage3-windows-v3.1.') || startsWith(inputs.release_tag || github.ref_name, 'stage3-windows-v3.3.') }}
+  REUSE_LAME_MEDIA: ${{ startsWith(inputs.release_tag || github.ref_name, 'stage3-windows-v3.3.') }}
 
 jobs:
   build:
@@ -74,9 +75,15 @@ jobs:
         run: |
           $archive = Join-Path $env:RUNNER_TEMP 'verified-media-tools.zip'
           $extract = Join-Path $env:RUNNER_TEMP 'verified-media-tools'
-          curl.exe -fL --retry 3 -o $archive https://github.com/autogeschichten-dev/MovieReviewStudio/releases/download/stage2-windows-v2.1.0/MovieReviewStudio-Windows-x64.zip
+          $tag = 'stage2-windows-v2.1.0'
+          $checksum = 'c46f6cdc7a86e336dfe9bdb00addfd909216fc4a1f030a74dd6e7d07ef9954e2'
+          if ($env:REUSE_LAME_MEDIA -eq 'true') {
+            $tag = 'stage3-windows-v3.2.1'
+            $checksum = '3bf1a7dd79228ba7288f60a108a79a80e83b5745ec197055fca11843b152cb72'
+          }
+          curl.exe -fL --retry 3 -o $archive "https://github.com/autogeschichten-dev/MovieReviewStudio/releases/download/$tag/MovieReviewStudio-Windows-x64.zip"
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          if ((Get-FileHash $archive -Algorithm SHA256).Hash -ne 'c46f6cdc7a86e336dfe9bdb00addfd909216fc4a1f030a74dd6e7d07ef9954e2') {
+          if ((Get-FileHash $archive -Algorithm SHA256).Hash -ne $checksum) {
             throw 'The prior release archive did not match its verified checksum.'
           }
           Expand-Archive -Path $archive -DestinationPath $extract
@@ -99,7 +106,7 @@ jobs:
               throw "Tests would use a different copy of $name."
             }
           }
-          if ($env:RELEASE_TAG -like 'stage3-*' -and $env:REUSE_WINDOWS_MEDIA -eq 'false') {
+          if ($env:RELEASE_TAG -like 'stage3-*' -and ($env:REUSE_WINDOWS_MEDIA -eq 'false' -or $env:REUSE_LAME_MEDIA -eq 'true')) {
             if (!(ffmpeg -hide_banner -encoders | Select-String '\blibmp3lame\b')) {
               throw 'The Windows FFmpeg build is missing the MP3 encoder.'
             }
@@ -185,6 +192,8 @@ jobs:
             title="Movie Review Studio V3.1.5 — AI Planning Duration Recovery"
           elif [[ "$RELEASE_TAG" == "stage3-windows-v3.2.1" ]]; then
             title="Movie Review Studio V3.2.1 — Multi-Part Voice-over Manager"
+          elif [[ "$RELEASE_TAG" == "stage3-windows-v3.3.0" ]]; then
+            title="Movie Review Studio V3.3.0 — Adaptive Duration and Timeline Editing"
           fi
           gh release create "$RELEASE_TAG" "$ZIP_NAME" \
             --repo "$GITHUB_REPOSITORY" --verify-tag \

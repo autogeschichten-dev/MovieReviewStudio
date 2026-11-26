@@ -153,6 +153,7 @@ class NarrationTests(unittest.TestCase):
         os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
         application = QApplication.instance() or QApplication([])
         studio = Studio(self.root)
+        studio.duration_mode = "fixed"
         self.addCleanup(studio.close)
         studio.open_voice_manager()
         self.assertEqual(len(studio.voice_parts), 3)

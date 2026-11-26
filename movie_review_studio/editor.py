@@ -90,6 +90,7 @@ class Timeline(QWidget):
         self.drop_row = None
         self.setMinimumHeight(RULER_HEIGHT + sum(TRACK_HEIGHTS) + 4)
         self.setMouseTracking(True)
+        self.setFocusPolicy(Qt.FocusPolicy.ClickFocus)
         self.setAccessibleName('Montage timeline')
 
     def set_clips(self, clips):
@@ -138,7 +139,9 @@ class Timeline(QWidget):
                     self.regions[1].append((start, min(end, start + available), narrated / fps, False))
                 narrated += end - start
         if studio.music and self.total:
-            self.regions[2].append((0, self.total, 0, True))
+            ending = studio.clips[-1]
+            end = self.total - (ending.frames if ending.movie_audio and ending.role == "Ending" else 0)
+            self.regions[2].append((0, end, 0, True))
         self.update()
 
     def paintEvent(self, event):
@@ -153,7 +156,7 @@ class Timeline(QWidget):
                 if self.regions:
                     self.paint_waveforms(painter, event.rect(), self.regions[index],
                                          self.studio.waves[key].peaks, 82 + index * 29,
-                                         (ORANGE, BLUE, GREEN)[index])
+                                         (ORANGE, GREEN, PURPLE)[index])
             studio = self.studio
             if studio.voice_sync_valid() and studio.voice_recording:
                 from .narration import markers
@@ -196,15 +199,15 @@ class Timeline(QWidget):
             if left > rect.right():
                 break
             box = QRectF(left, 28, max(1, right - left - 1), 51)
-            painter.fillRect(box, QColor(PURPLE if clip.role else ORANGE if clip.movie_audio else BLUE))
+            painter.fillRect(box, QColor("#912c48" if clip.gap else ORANGE if clip.movie_audio else BLUE))
             if box.width() > 42:
                 image = thumbnail(self.studio.cache, self.studio.source_key, clip.start)
-                if not image.isNull():
+                if not clip.gap and not image.isNull():
                     target = QRectF(left + 2, 30, min(84, box.width() - 4), 47)
                     painter.drawPixmap(target, image, QRectF(image.rect()))
                 painter.setPen(QColor('#ffffff'))
                 painter.drawText(QRectF(left + 4, 30, box.width() - 5, 46),
-                                 Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignBottom, clip.role or str(row + 1))
+                                 Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignBottom, "GAP" if clip.gap else ("◆ " if clip.locked else "") + (clip.role or str(row + 1)))
             if row in (self.selection, self.studio.active_row, self.drop_row):
                 painter.setPen(QPen(QColor('#ffdc80' if row == self.studio.active_row else '#ffffff'), 2))
                 painter.drawRect(box.adjusted(1, 1, -1, -1))

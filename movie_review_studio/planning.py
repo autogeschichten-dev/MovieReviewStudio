@@ -274,11 +274,11 @@ def fit_route(route, chapters, budgets, model_ids, fps, min_gap, goal, minimum):
 
 
 def plan(movie, analysis, highlights, provider, mode, language, target, custom, cache, progress,
-         clips, observations, transcript, custom_parts, report=None, *, min_gap=DEFAULT_SOURCE_GAP, expand=None, expand_live=True):
+         clips, observations, transcript, custom_parts, report=None, *, min_gap=DEFAULT_SOURCE_GAP, expand=None, expand_live=True, adaptive=False):
     from .director import ScriptSection, timeline_document
 
     shots = registry(clips, observations, movie, analysis.frames)
-    goal = min(int(1080 * movie.fps), round(target * movie.fps))
+    goal = math.ceil(target * movie.fps) if adaptive else min(int(1080 * movie.fps), round(target * movie.fps))
     remaining = goal - sum(clip.frames for clip in highlights)
     report = report or cache / "ai-planning-diagnostic.jsonl"
     planner = TextPlanner(provider, report)
@@ -394,8 +394,8 @@ def plan(movie, analysis, highlights, provider, mode, language, target, custom, 
         # Individual highlights must be valid; other clips can bridge their cuts.
         for highlight in picked:
             validate([highlight], movie.fps, analysis.frames, has_audio=movie.has_audio, min_gap=min_gap)
-    minimum = max(math.ceil(1020 * movie.fps), goal - int(5 * movie.fps))
-    hard_limit = int(1080 * movie.fps)
+    minimum = goal if adaptive else max(math.ceil(1020 * movie.fps), goal - int(5 * movie.fps))
+    hard_limit = goal + math.ceil(5 * movie.fps) if adaptive else int(1080 * movie.fps)
     chapter_rows = []
     total_weight = sum(shot.clip.frames for shot in ordered)
     picture_budget = max(0, remaining)
@@ -575,7 +575,9 @@ def plan(movie, analysis, highlights, provider, mode, language, target, custom, 
             sections[-1] = ScriptSection(section_id, previous.text, previous.evidence + evidence)
         else:
             sections.append(ScriptSection(section_id, text, evidence))
-    validate(picked, movie.fps, analysis.frames, final=True, has_audio=movie.has_audio, min_gap=min_gap)
+    from .adaptive import bookends
+    picked = bookends(picked)
+    validate(picked, movie.fps, analysis.frames, final=not adaptive, has_audio=movie.has_audio, min_gap=min_gap)
     timeline = timeline_document(movie, picked, sections)
     recap_render.validate_timeline_physical(timeline, strict=True)
     atomic_json(directory / "timeline.json", timeline)

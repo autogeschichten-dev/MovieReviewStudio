@@ -154,11 +154,12 @@ def suggest_highlights(movie, analysis, evidence, cache, progress):
 
 
 def assemble(candidates, highlights, fps, source_frames, target_seconds, evidence, progress, *,
-             min_gap=DEFAULT_SOURCE_GAP):
+             min_gap=DEFAULT_SOURCE_GAP, adaptive=False):
     """Distribute selected footage over the source and keep its source order."""
-    minimum = math.ceil(1020 * fps)
-    ceiling = int(1080 * fps)
-    target = max(minimum, min(ceiling, round(target_seconds * fps)))
+    goal = math.ceil(target_seconds * fps)
+    minimum = goal if adaptive else math.ceil(1020 * fps)
+    ceiling = goal + math.ceil(5 * fps) if adaptive else int(1080 * fps)
+    target = max(minimum, min(ceiling, goal if adaptive else round(target_seconds * fps)))
     selected = sorted(highlights, key=lambda clip: clip.start)
     starts = [clip.start for clip in selected]
     frames = sum(clip.frames for clip in selected)
@@ -208,6 +209,18 @@ def assemble(candidates, highlights, fps, source_frames, target_seconds, evidenc
                 break
             prefer_distinct = False
     if frames < minimum or frames < target - math.ceil(5 * fps):
-        raise ValueError('There is insufficient distinct usable footage for the chosen 17–18 minute target and source separation.')
-    validate(selected, fps, source_frames, final=True, min_gap=min_gap)
+        if adaptive:
+            from .planning import Shot, longest_route
+            pool = {str(c.start): Shot(str(c.start), c, "", 0, "") for c in candidates
+                    if not c.production_card and not any(overlaps(c, h) for h in highlights)}
+            route = longest_route(pool, highlights, fps, min_gap)
+            capacity = sum(c.frames for c, _ in route)
+            if capacity < minimum:
+                raise ValueError(f"Available chronological picture: {float(capacity / fps):.3f} s under source gap, overlap, and visual cut rules.")
+            selected = [c for c, _ in route]
+        else:
+            raise ValueError('There is insufficient distinct usable footage for the chosen 17–18 minute target and source separation.')
+    if not adaptive:
+        from .adaptive import bookends
+        validate(bookends(selected), fps, source_frames, final=True, min_gap=min_gap)
     return selected

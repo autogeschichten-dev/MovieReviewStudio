@@ -31,12 +31,14 @@ def dimensions(movie: Media, preview: bool) -> tuple[int, int]:
     return max(2, round(height * ratio / 2) * 2), height
 
 
-def render_clip(movie: Media, clip: Clip, destination: Path, preview: bool):
+def render_clip(movie: Media, clip: Clip, destination: Path, preview: bool, *, fade=False):
     if not 0 < clip.frames / movie.fps <= MAX_CLIP_SECONDS:
         raise ValueError("Each video segment must be at most 5 seconds.")
     width, height = dimensions(movie, preview)
+    fade_frames = min(clip.frames - 1, round(movie.fps))
+    fading = f",fade=t=out:s={clip.frames - fade_frames - 1}:n={fade_frames}" if fade and fade_frames else ""
     ffmpeg(*video_seek(movie, clip.start), "-map", "0:v:0", "-an", "-sn", "-dn",
-           "-vf", f"scale={width}:{height}:flags=lanczos,setsar=1,setpts=N*{movie.fps.denominator}/{movie.fps.numerator}/TB",
+           "-vf", f"scale={width}:{height}:flags=lanczos,setsar=1,setpts=N*{movie.fps.denominator}/{movie.fps.numerator}/TB{fading}",
            "-frames:v", str(clip.frames), "-r", str(movie.fps), "-fps_mode", "cfr",
            "-c:v", "libx264", "-threads", "3", "-preset", "ultrafast" if preview else "fast",
            "-crf", "25" if preview else "17", "-pix_fmt", "yuv420p",
@@ -99,7 +101,7 @@ def audio_track(movie: Media, clips: list[Clip], voice: Path | None, music: Path
                 # Decode dialogue once across all the group's video cuts.
                 original = f"aresample={RATE}:async=1:first_pts=0,{limit},{edges}"
                 args = ["-ss", seconds(timestamp), "-i", str(movie.path)]
-                if mix and "music" in inputs:
+                if mix and "music" in inputs and clip.role != "Ending":
                     path, length = inputs["music"]
                     args += ["-stream_loop", "-1", "-ss", seconds(Fraction(samples(start) % length, RATE)),
                              "-i", str(path)]
@@ -152,14 +154,14 @@ def audio_track(movie: Media, clips: list[Clip], voice: Path | None, music: Path
     return output
 
 
-def preview_chunk(cache: Path, source_key: str, clip: Clip) -> Path:
-    return cache / f"{VERSION}-{source_key}-{clip.start}-{clip.end}.mp4"
+def preview_chunk(cache: Path, source_key: str, clip: Clip, *, fade=False) -> Path:
+    return cache / f"{VERSION}-{source_key}-{clip.start}-{clip.end}{'-fade' if fade else ''}.mp4"
 
 
 def render_selection(movie: Media, analysis: Analysis, clips: list[Clip], row: int,
-                     voice: Path | None, music: Path | None, cache: Path, progress, *, mix: Mix | None = None, managed_voice=False) -> Path:
+                     voice: Path | None, music: Path | None, cache: Path, progress, *, mix: Mix | None = None, managed_voice=False, fade_ending=False) -> Path:
     entry = timeline_entries(clips, movie.fps)[row]
-    assembly = render(movie, analysis, clips, voice, music, cache, progress, mix=mix, managed_voice=managed_voice)
+    assembly = render(movie, analysis, clips, voice, music, cache, progress, mix=mix, managed_voice=managed_voice, fade_ending=fade_ending)
     destination = cache / f"{assembly.stem}-clip-{row + 1}.mp4"
     if destination.is_file():
         return destination
@@ -167,10 +169,11 @@ def render_selection(movie: Media, analysis: Analysis, clips: list[Clip], row: i
     end = round((entry.position + entry.segment.frames) * RATE / movie.fps)
     with tempfile.TemporaryDirectory(prefix=".mrs-", dir=cache) as temporary:
         folder = Path(temporary)
-        video = preview_chunk(cache, identity(movie.path), entry.segment)
+        fade = fade_ending and row == len(timeline_entries(clips, movie.fps)) - 1 and entry.segment.role == "Ending"
+        video = preview_chunk(cache, identity(movie.path), entry.segment, fade=fade)
         if not video.is_file():
             video = folder / "video.mp4"
-            render_clip(replace(movie, offset=analysis.offset), entry.segment, video, True)
+            render_clip(replace(movie, offset=analysis.offset), entry.segment, video, True, fade=fade)
         result = folder / "selected.mp4"
         progress("Preparing the selected clip with its montage audio…")
         ffmpeg("-i", str(video), "-i", str(assembly), "-map", "0:v:0", "-map", "1:a:0",
@@ -182,16 +185,20 @@ def render_selection(movie: Media, analysis: Analysis, clips: list[Clip], row: i
 
 def render(movie: Media, analysis: Analysis, clips: list[Clip], voice: Path | None,
            music: Path | None, cache: Path, progress, *, destination: Path | None = None, mix: Mix | None = None,
-           min_gap=DEFAULT_SOURCE_GAP, managed_voice=False, fitted_duration=False) -> Path:
+           min_gap=DEFAULT_SOURCE_GAP, managed_voice=False, fitted_duration=False, fade_ending=False) -> Path:
     preview = destination is None
+    if any(c.gap for c in clips):
+        raise ValueError("Fill unresolved picture gaps before rendering.")
     validate(clips, movie.fps, analysis.frames, final=not preview and not fitted_duration, has_audio=movie.has_audio,
              min_gap=min_gap, enforce_separation=not preview)
     entries = timeline_entries(clips, movie.fps)
     identities = [identity(path) if path else None for path in (movie.path, voice, music)]
-    key_data = (VERSION, identities, [(c.start, c.end, c.highlight, c.cuts, c.original, c.muted) for c in clips],
+    key_data = (VERSION, identities, [(c.start, c.end, c.highlight, c.cuts, c.original, c.muted, c.role) for c in clips],
                 (mix.original, mix.voice, mix.music) if mix else None)
     if managed_voice:
         key_data += ("managed-narration",)
+    if fade_ending:
+        key_data += ("fade-ending",)
     key = hashlib.sha256(json.dumps(key_data).encode()).hexdigest()
     destination = destination or cache / f"preview-{key}.mp4"
     if destination.resolve() in {path.resolve() for path in (movie.path, voice, music) if path}:
@@ -208,11 +215,12 @@ def render(movie: Media, analysis: Analysis, clips: list[Clip], voice: Path | No
             progress(f"Rendering video clip {index} of {len(entries)}…")
             name = f"clip-{index:04}.mp4"
             part = folder / name
-            cached = preview_chunk(cache, identities[0], clip)
+            fade = fade_ending and index == len(entries) and clip.role == "Ending"
+            cached = preview_chunk(cache, identities[0], clip, fade=fade)
             if preview and cached.is_file():
                 shutil.copyfile(cached, part)
             else:
-                render_clip(movie, clip, part, preview)
+                render_clip(movie, clip, part, preview, fade=fade)
                 if preview:
                     pending = folder / "chunk.mp4"
                     shutil.copyfile(part, pending)

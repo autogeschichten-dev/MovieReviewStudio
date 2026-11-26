@@ -229,7 +229,7 @@ def sample_group(group):
 
 
 def plan(movie, analysis, highlights, provider, mode, language, target, custom, cache, progress,
-         *, observations=None, transcript=None, report=None, min_gap=DEFAULT_SOURCE_GAP, expand_live=True):
+         *, observations=None, transcript=None, report=None, min_gap=DEFAULT_SOURCE_GAP, expand_live=True, adaptive=False):
     progress("Probing source with Video Recap Skills…")
     metadata = probe.probe_sources([movie.path])
     if not metadata["sources"][0].get("has_video"):
@@ -264,7 +264,7 @@ def plan(movie, analysis, highlights, provider, mode, language, target, custom, 
         from .planning import plan as plan_grounded
         return plan_grounded(movie, analysis, highlights, provider, mode, language, target, custom, cache,
                              progress, candidates, observations, transcript,
-                             custom_parts if mode == "Custom Script" else [], report, min_gap=min_gap, expand=expand, expand_live=expand_live)
+                             custom_parts if mode == "Custom Script" else [], report, min_gap=min_gap, expand=expand, expand_live=expand_live, adaptive=adaptive)
     all_clips = sorted(highlights, key=lambda c: c.start)
     frame_dir = cache / f"recap-frames-{identity(movie.path)}"
     frame_dir.mkdir(exist_ok=True)

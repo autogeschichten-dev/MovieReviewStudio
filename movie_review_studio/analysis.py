@@ -184,19 +184,26 @@ def analyze(media: Media, cache: Path, progress) -> Analysis:
 
 
 def fingerprint_highlight(media: Media, analysis: Analysis, start: int, end: int, *,
-                          cache: Path | None = None, cuts: tuple[int, ...] | None = None) -> Clip:
-    if not media.has_audio or not 0 <= start < end <= analysis.frames or not 10 <= (end - start) / media.fps <= 15:
-        raise ValueError("A highlight needs movie audio and a 10–15 second range inside the movie.")
+                          cache: Path | None = None, cuts: tuple[int, ...] | None = None,
+                          role: str = "", candidate: Clip | None = None) -> Clip:
+    if candidate:
+        if not candidate.start <= start < end <= candidate.end:
+            raise ValueError("A fragment must stay inside its analyzed source shot.")
+    else:
+        minimum, maximum = (1, 30) if role in {"Opening", "Ending"} else (1, 15) if role == "Highlight" else (10, 15)
+        if not media.has_audio or not 0 <= start < end <= analysis.frames or not minimum <= (end - start) / media.fps <= maximum:
+            raise ValueError(f"An original-audio group needs a {minimum}–{maximum} second source range.")
     media = replace(media, offset=analysis.offset)
-    cuts = highlight_cuts(start, end, media.fps, analysis.shot_starts) if cuts is None else cuts
-    clip = Clip(start, end, 0, (), (), (), True, cuts=cuts)
+    cuts = () if candidate else (highlight_cuts(start, end, media.fps, analysis.shot_starts) if cuts is None else cuts)
+    clip = replace(candidate, start=start, end=end) if candidate else Clip(start, end, 0, (), (), (), True, cuts=cuts, role=role)
     parts = video_segments(clip, media.fps)
-    if not cuts or any(not 0 < part.frames / media.fps <= MAX_CLIP_SECONDS for part in parts):
+    if any(not 0 < part.frames / media.fps <= MAX_CLIP_SECONDS for part in parts):
         raise ValueError("Saved highlight segments must be contiguous and at most 5 seconds each.")
     length = end - start
     middle = np.linspace(0, length - 1, 5, dtype=int)
     thumbnails = {part.start - start for part in parts} if cache else set()
-    indices = sorted(set(range(3)) | set(range(length - 3, length)) | set(middle) | thumbnails)
+    edge = min(3, length)
+    indices = sorted(set(range(edge)) | set(range(length - edge, length)) | set(middle) | thumbnails)
     select = "+".join(f"eq(n\\,{index})" for index in indices)
     data = ffmpeg(*video_seek(media, start), "-map", "0:v:0", "-an",
                   "-vf", f"select={select},scale={WIDTH}:{HEIGHT}",
@@ -211,6 +218,6 @@ def fingerprint_highlight(media: Media, analysis: Analysis, start: int, end: int
         for index, frame in zip(indices, frames):
             if index in thumbnails:
                 save_thumbnail(cache, key, start + index, frame)
-    return replace(clip, first=tuple(fingerprints[i] for i in range(3)),
-                   last=tuple(fingerprints[i] for i in range(length - 3, length)),
+    return replace(clip, first=tuple(fingerprints[i] for i in range(edge)),
+                   last=tuple(fingerprints[i] for i in range(length - edge, length)),
                    samples=tuple(fingerprints[i] for i in middle))
