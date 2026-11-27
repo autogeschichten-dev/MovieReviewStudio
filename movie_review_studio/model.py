@@ -26,7 +26,7 @@ class Clip:
     samples: tuple[Signature, ...]
     highlight: bool = False
     shot: int | None = None
-    cuts: tuple[int, ...] = ()  # Internal video boundaries of a continuous highlight.
+    cuts: tuple[int, ...] = ()  # Legacy project boundaries, retained for repair diagnostics only.
 
     original: bool = False
     production_card: bool = False
@@ -34,6 +34,8 @@ class Clip:
     role: str = ""
     locked: bool = False
     gap: bool = False
+    picture: tuple["Clip", ...] = ()  # Original-audio groups own independent picture edits.
+    legacy_shots: tuple[int, ...] = ()
 
     @property
     def movie_audio(self):
@@ -64,9 +66,14 @@ def highlight_cuts(start: int, end: int, fps: Fraction, shot_starts=()) -> tuple
 def video_segments(clip: Clip, fps: Fraction) -> tuple[Clip, ...]:
     if not clip.highlight:
         return (clip,)
+    if clip.picture:
+        return tuple(replace(part, highlight=True, muted=clip.muted, original=clip.original,
+                             role=clip.role, locked=clip.locked) for part in clip.picture)
     cuts = clip.cuts or highlight_cuts(clip.start, clip.end, fps)
     bounds = (clip.start, *cuts, clip.end)
-    return tuple(replace(clip, start=start, end=end, cuts=()) for start, end in zip(bounds, bounds[1:]))
+    return tuple(replace(clip, start=start, end=end, cuts=(),
+                         shot=clip.legacy_shots[i] if i < len(clip.legacy_shots) else clip.shot)
+                 for i, (start, end) in enumerate(zip(bounds, bounds[1:])))
 
 
 @dataclass(frozen=True)
@@ -110,6 +117,10 @@ def source_gap(left: Clip, right: Clip) -> int:
 
 
 def cut_issue(left: Clip, right: Clip, fps=None, min_gap=DEFAULT_SOURCE_GAP):
+    if left.picture:
+        left = left.picture[-1]
+    if right.picture:
+        right = right.picture[0]
     if left.gap or right.gap:
         return None
     if left.shot is not None and left.shot == right.shot:
@@ -124,7 +135,7 @@ def cut_issue(left: Clip, right: Clip, fps=None, min_gap=DEFAULT_SOURCE_GAP):
             return "overlap"
         if gap == 0:
             return "contiguous_source"
-        if gap / fps < min_gap:
+        if gap / fps < max(DEFAULT_SOURCE_GAP, min_gap):
             return "insufficient_source_gap"
     return None
 
@@ -143,12 +154,62 @@ CUT_MESSAGES = {
 
 
 def overlaps(left: Clip, right: Clip) -> bool:
-    return left.start < right.end and right.start < left.end
+    return any(a.start < b.end and b.start < a.end
+               for a in left.picture or (left,) for b in right.picture or (right,))
+
+
+def fragment_issues(clips, fps, source_frames, min_gap=DEFAULT_SOURCE_GAP):
+    """Audit actual rendered picture intervals, independent of audio grouping."""
+    entries = list(enumerate(timeline_entries(clips, fps), 1))
+    issues = []
+
+    def detail(number, entry):
+        clip = entry.segment
+        return {"fragment_id": f"v{number}", "edit": entry.edit_index + 1, "source_shot_id": clip.shot,
+                "source_start_frame": clip.start, "source_end_frame": clip.end,
+                "source_start_seconds": float(clip.start / fps), "source_end_seconds": float(clip.end / fps),
+                "audio_mode": "original" if clip.movie_audio else "narration"}
+
+    def issue(reason, left, right=None):
+        issues.append({"reason": reason, "left": detail(*left), "right": detail(*right) if right else None,
+                       "source_gap_seconds": float(source_gap(left[1].segment, right[1].segment) / fps) if right else None,
+                       "replacement_result": "unresolved"})
+
+    visible = []
+    for row in entries:
+        _, entry = row
+        clip = entry.segment
+        if clip.gap:
+            continue
+        if not 0 <= clip.start < clip.end <= source_frames:
+            issue("invalid_source_range", row)
+        if clip.frames / fps > MAX_CLIP_SECONDS:
+            issue("fragment_too_long", row)
+        visible.append(row)
+    for left, right in zip(entries, entries[1:]):
+        a, b = left[1].segment, right[1].segment
+        if a.gap or b.gap:
+            continue
+        gap = source_gap(a, b)
+        if gap == 0:
+            issue("contiguous_source", left, right)
+        elif 0 < gap / fps < max(DEFAULT_SOURCE_GAP, min_gap):
+            issue("insufficient_source_gap", left, right)
+        reason = cut_issue(a, b)
+        if reason:
+            issue(reason, left, right)
+    ordered = sorted(visible, key=lambda row: row[1].segment.start)
+    for index, left in enumerate(ordered):
+        for right in ordered[index + 1:]:
+            if right[1].segment.start >= left[1].segment.end:
+                break
+            if overlaps(left[1].segment, right[1].segment):
+                issue("overlap", left, right)
+    return issues
 
 
 def validate(clips: list[Clip], fps: Fraction, source_frames: int, *,
-             final: bool = False, has_audio: bool = True,
-             min_gap: int = DEFAULT_SOURCE_GAP, enforce_separation: bool = True) -> None:
+             final: bool = False, has_audio: bool = True, min_gap: int = DEFAULT_SOURCE_GAP) -> None:
     if min_gap < 0:
         raise ValueError("Minimum source separation cannot be negative.")
     if not clips:
@@ -175,46 +236,29 @@ def validate(clips: list[Clip], fps: Fraction, source_frames: int, *,
             low, high = (1, 30) if cinematic else (1, 15) if clip.role == "Highlight" else (10, 15)
             if not has_audio or not low <= duration <= high:
                 raise ValueError(f"Highlight {number} needs movie audio and a length of {low}–{high} seconds.")
-            parts = video_segments(clip, fps)
-            if any(not 0 < part.frames / fps <= MAX_CLIP_SECONDS for part in parts):
-                raise ValueError(f"Highlight {number} has an invalid segment. Each segment must be at most 5 seconds.")
-        elif duration > MAX_CLIP_SECONDS:
-            raise ValueError(f"Regular clip {number} exceeds 5 seconds.")
-        if index:
-            issue = cut_issue(clips[index - 1], clip, fps if enforce_separation else None, min_gap)
-            if issue:
-                raise ValueError(f"Clips {index} and {number} {CUT_MESSAGES[issue]}.")
-    ordered = sorted(((i, c) for i, c in enumerate(clips, 1) if not c.gap), key=lambda item: item[1].start)
-    for (a, left), (b, right) in zip(ordered, ordered[1:]):
-        if overlaps(left, right):
-            raise ValueError(f"Clips {a} and {b} overlap or reuse the same source frames.")
+            if clip.picture and (any(part.highlight or part.picture or part.gap or part.shot is None for part in clip.picture)
+                                 or sum(part.frames for part in clip.picture) != clip.frames):
+                raise ValueError(f"Original-audio group {number} needs identified picture fragments matching its audio duration.")
+    issues = fragment_issues(clips, fps, source_frames, min_gap)
+    if issues:
+        first = issues[0]
+        left, right = first["left"], first["right"]
+        reason = first["reason"]
+        if right:
+            raise ValueError(f"Clips {left['fragment_id']} and {right['fragment_id']} {CUT_MESSAGES[reason]}.")
+        if reason == "fragment_too_long":
+            raise ValueError(f"Fragment {left['fragment_id']} exceeds 5 seconds.")
+        raise ValueError(f"Fragment {left['fragment_id']} lies outside the source.")
     if highlights > 3:
         raise ValueError("The montage supports up to three original-audio highlight groups.")
     if final and not 960 <= sum(clip.frames for clip in clips) / fps <= 1080:
         raise ValueError("The final montage must be 16–18 minutes including highlights.")
 
 
-def separation_issues(clips, fps, min_gap=DEFAULT_SOURCE_GAP):
-    """Key violations by source ranges, so old edits can be repaired one cut at a time."""
-    issues = {}
-    for left, right in zip(clips, clips[1:]):
-        if left.gap or right.gap:
-            continue
-        gap = source_gap(left, right)
-        if gap == 0 or 0 < gap / fps < min_gap:
-            issues[(left.start, left.end, right.start, right.end)] = (
-                "contiguous_source" if gap == 0 else "insufficient_source_gap")
-    return issues
-
-
 def timeline_validation_report(clips, fps, source_frames, *, has_audio=True, min_gap=DEFAULT_SOURCE_GAP,
                                fitted_duration=False):
     entries = timeline_entries(clips, fps)
-    cuts = []
-    for index, (left, right) in enumerate(zip(clips, clips[1:]), 1):
-        issue = cut_issue(left, right, fps, min_gap)
-        cuts.append({"left_edit": index, "right_edit": index + 1,
-                     "source_gap_seconds": float(source_gap(left, right) / fps), "issue": issue})
+    issues = fragment_issues(clips, fps, source_frames, min_gap)
     try:
         if any(c.gap for c in clips):
             raise ValueError("Fill unresolved picture gaps before export.")
@@ -223,25 +267,23 @@ def timeline_validation_report(clips, fps, source_frames, *, has_audio=True, min
         failure = str(error)
     else:
         failure = None
-    ordered = sorted(((i, c) for i, c in enumerate(clips, 1) if not c.gap), key=lambda item: item[1].start)
-    overlapping = []
-    for offset, (index, clip) in enumerate(ordered):
-        for other_index, other in ordered[offset + 1:]:
-            if other.start >= clip.end:
-                break
-            if overlaps(clip, other):
-                overlapping.append([index, other_index])
-    return {"passed": failure is None, "overlapping_edits": overlapping, "first_error": failure, "source_fps": str(fps),
-            "minimum_source_gap_seconds": min_gap, "maximum_fragment_seconds": MAX_CLIP_SECONDS,
-            "duration_fitted_to_narration": fitted_duration,
-            "duration_seconds": float(sum(clip.frames for clip in clips) / fps), "cuts": cuts,
-            "fragments": [{"edit": entry.edit_index + 1, "source_start_frame": entry.segment.start,
-                           "source_end_frame": entry.segment.end, "timeline_start_frame": entry.position,
-                           "duration_seconds": float(entry.segment.frames / fps)} for entry in entries],
-            "highlight_exceptions": [{"edit": index, "source_start_frame": clip.start,
-                                       "source_end_frame": clip.end, "movie_audio_enabled": clip.movie_audio}
-                                      for index, clip in enumerate(clips, 1)
-                                      if clip.highlight]}
+    overlapping = [[row["left"]["edit"], row["right"]["edit"]] for row in issues if row["reason"] == "overlap"]
+    return {"passed": failure is None, "overlapping_edits": overlapping, "first_error": failure,
+            "source_fps": str(fps), "minimum_source_gap_seconds": max(DEFAULT_SOURCE_GAP, min_gap),
+            "maximum_fragment_seconds": MAX_CLIP_SECONDS, "duration_fitted_to_narration": fitted_duration,
+            "duration_seconds": float(sum(clip.frames for clip in clips) / fps), "violations": issues,
+            "adjacent_source_fragment_violations": len({(row["left"]["fragment_id"], row["right"]["fragment_id"])
+                                                       for row in issues if row["reason"] in CUT_MESSAGES
+                                                       and row["right"] and abs(int(row["left"]["fragment_id"][1:])
+                                                       - int(row["right"]["fragment_id"][1:])) == 1}),
+            "source_overlap_violations": len(overlapping),
+            "touching_source_interval_violations": sum(row["reason"] == "contiguous_source" for row in issues),
+            "fragments_longer_than_five_seconds": sum(row["reason"] == "fragment_too_long" for row in issues),
+            "original_audio_visual_exceptions": 0,
+            "fragments": [{"fragment_id": f"v{i}", "edit": entry.edit_index + 1, "source_shot_id": entry.segment.shot,
+                           "source_start_frame": entry.segment.start, "source_end_frame": entry.segment.end,
+                           "timeline_start_frame": entry.position, "audio_mode": "original" if entry.segment.movie_audio else "narration",
+                           "duration_seconds": float(entry.segment.frames / fps)} for i, entry in enumerate(entries, 1)]}
 
 
 def choose(candidates: list[Clip], highlights: list[Clip], fps: Fraction,

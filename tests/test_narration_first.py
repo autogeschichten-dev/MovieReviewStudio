@@ -9,6 +9,8 @@ import unittest
 from unittest.mock import patch
 import wave
 
+from strict_fixtures import audio_group
+
 from movie_review_studio import adaptive, narration
 from movie_review_studio.media import ffmpeg, inspect
 from movie_review_studio.model import Clip, timeline_entries
@@ -33,7 +35,9 @@ class NarrationFirstTests(unittest.TestCase):
         movie = SimpleNamespace(fps=fps, has_audio=True)
         analysis = SimpleNamespace(frames=500)
         opening, highlight, ending = clip(0, 20, "Opening"), clip(80, 24, "Highlight"), clip(210, 20, "Ending")
-        left, right = clip(35, 8), clip(140, 8)
+        opening = audio_group(opening, [(0, 10), (20, 30)])
+        ending = audio_group(ending, [(210, 220), (230, 240)])
+        left, right = clip(40, 8), clip(140, 8)
         notices = []
         recording = narration.Recording(Path("fixture"), 8 * RATE, ())
         with patch.object(adaptive, "quiet_ranges", return_value=[]):
@@ -48,6 +52,10 @@ class NarrationFirstTests(unittest.TestCase):
         analysis = SimpleNamespace(frames=500)
         opening, ending = clip(0, 10, "Opening"), clip(400, 10, "Ending")
         first, second = clip(120, 12, "Highlight"), clip(240, 12, "Highlight")
+        opening = audio_group(opening, [(0, 5), (15, 20)])
+        first = audio_group(first, [(120, 125), (135, 140), (150, 152)])
+        second = audio_group(second, [(240, 245), (255, 260), (270, 272)])
+        ending = audio_group(ending, [(400, 405), (415, 420)])
         picture = [opening, clip(30, 5), first, clip(170, 5), second, clip(300, 5), ending]
         recording = narration.Recording(Path("fixture"), 15 * RATE, ())
         quiet = [(5 * RATE, 5 * RATE), (10 * RATE, 10 * RATE)]
@@ -101,14 +109,18 @@ class NarrationFirstMediaTests(unittest.TestCase):
         movie = SimpleNamespace(fps=fps, has_audio=True)
         analysis = SimpleNamespace(frames=90000)
         opening, intermediate, ending = clip(0, 240 - 1, "Opening"), clip(32000, 288, "Highlight"), clip(80000, 239, "Ending")
+        opening = audio_group(opening, [(0, 119), (300, 419), (550, 551)])
+        intermediate = audio_group(intermediate, [(32000, 32119), (32240, 32359), (32480, 32530)])
+        ending = audio_group(ending, [(80000, 80119), (80300, 80419), (80550, 80551)])
         total = adaptive.narration_frames(merged, fps)
         left = [clip(1000 + 245 * i, 119) for i in range(80)]
         before = sum(item.frames for item in left)
-        remainder = total + 19 - before
-        full, tail = divmod(remainder, 119)
-        right = [clip(33000 + 245 * i, 119) for i in range(full)]
-        if tail:
-            right.append(clip(33000 + 245 * full, tail))
+        to_pause = round(Fraction(460125, 1000) * fps) - before
+        full, tail = divmod(to_pause, 119)
+        lengths = [119] * full + ([tail] if tail else [])
+        full, tail = divmod(total + 19 - before - to_pause, 119)
+        lengths.extend([119] * full + ([tail] if tail else []))
+        right = [clip(33000 + 245 * i, length) for i, length in enumerate(lengths)]
         edit = [opening, *left, intermediate, *right, ending]
         # V3.3.1 searched only inside the interval made possible by its two fixed runs.
         old_low = round((before - 19) * RATE / fps)
@@ -137,16 +149,16 @@ class NarrationFirstMediaTests(unittest.TestCase):
 
     def test_repositioned_highlight_and_bookends_render_to_mp4(self):
         movie_path = self.root / "film.mp4"
-        ffmpeg("-f", "lavfi", "-i", "testsrc2=s=96x64:r=4:d=35", "-f", "lavfi", "-i", "sine=f=300:d=35",
+        ffmpeg("-f", "lavfi", "-i", "testsrc2=s=96x64:r=4:d=45", "-f", "lavfi", "-i", "sine=f=300:d=45",
                "-c:v", "libx264", "-c:a", "aac", str(movie_path))
         parts = [self.write_part(i, 1.5, rate=48000) for i in (1, 2, 3)]
         merged = narration.merge(parts, 500, False, self.root, self.progress)
         movie = inspect(movie_path)
-        analysis = SimpleNamespace(offset=0, frames=140, shot_starts=())
-        opening, highlight, ending = clip(0, 8, "Opening"), clip(58, 8, "Highlight"), clip(126, 8, "Ending")
-        first, last = clip(32, 8), clip(90, 14)
+        analysis = SimpleNamespace(offset=0, frames=180, shot_starts=())
+        opening, highlight, ending = clip(0, 8, "Opening"), clip(58, 8, "Highlight"), clip(156, 8, "Ending")
+        first, middle, last = clip(32, 8), clip(90, 7), clip(124, 7)
         picture, _, schedule, length, _ = adaptive.fit_recording(
-            merged, [opening, first, highlight, last, ending], movie, analysis, self.root, 5, self.progress)
+            merged, [opening, first, highlight, middle, last, ending], movie, analysis, self.root, 5, self.progress)
         self.assertEqual([c for c in picture if c.movie_audio], [opening, highlight, ending])
         self.assertEqual([original for original, _, _ in audio_spans(picture)], [True, False, True, False, True])
         bed = narration.materialize(merged, schedule, length, self.root)

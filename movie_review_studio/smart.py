@@ -147,7 +147,10 @@ def suggest_highlights(movie, analysis, evidence, cache, progress):
         if any(abs(start - clip.start) < analysis.frames / 6 for clip in selected):
             continue
         progress(f'Reading suggested highlight {len(selected) + 1}…')
-        selected.append(fingerprint_highlight(movie, analysis, start, end, cache=cache))
+        try:
+            selected.append(fingerprint_highlight(movie, analysis, start, end, cache=cache, reserved=selected))
+        except ValueError:
+            continue
         if len(selected) == 3:
             break
     return sorted(selected, key=lambda clip: clip.start)

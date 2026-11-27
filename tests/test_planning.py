@@ -6,6 +6,8 @@ from unittest import TestCase
 from unittest.mock import patch
 import json
 
+from strict_fixtures import audio_group
+
 from movie_review_studio import local_ai, planning
 from movie_review_studio.director import chapters, sample_group
 from movie_review_studio.media import Cancelled, identity
@@ -148,8 +150,9 @@ class RecoveryTests(TestCase):
             source.write_bytes(b"fixture")
             movie = SimpleNamespace(path=source, fps=Fraction(1), width=96, height=64, has_audio=True)
             clips = [Clip(i * 12, i * 12 + 5, 1, (), (), (), shot=i) for i in range(300)]
-            highlight = Clip(3600, 3612, 1, (), (), (), highlight=True)
-            analysis = SimpleNamespace(frames=3612, candidates=clips)
+            highlight = audio_group(Clip(3600, 3612, 1, (), (), (), highlight=True),
+                                    [(3600, 3605), (3610, 3615), (3620, 3622)])
+            analysis = SimpleNamespace(frames=3622, candidates=clips)
 
             def observation(clip, description):
                 return {"timestamp": clip.start + 2, "source_in": clip.start, "source_out": clip.end,

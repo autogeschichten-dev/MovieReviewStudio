@@ -34,8 +34,8 @@ class RecapLibraryTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             source = root / "source.mp4"
-            ffmpeg("-f", "lavfi", "-i", "testsrc2=s=160x90:r=12:d=6",
-                   "-f", "lavfi", "-i", "sine=frequency=340:duration=6",
+            ffmpeg("-f", "lavfi", "-i", "testsrc2=s=160x90:r=12:d=11",
+                   "-f", "lavfi", "-i", "sine=frequency=340:duration=11",
                    "-c:v", "libx264", "-c:a", "aac", "-shortest", str(source))
             source.with_suffix(".srt").write_text(
                 "1\n00:00:00,200 --> 00:00:01,800\nLa familia regresa.\n", encoding="utf-8")
@@ -47,8 +47,8 @@ class RecapLibraryTests(unittest.TestCase):
             thumb = root / "frame.jpg"
             director.frames.extract_frames(source, [1.25], thumb, width=96, labels=False)
             self.assertTrue(thumb.read_bytes().startswith(b"\xff\xd8"))
-            clips = [Clip(0, 36, 0, (), (), ()), Clip(48, 72, 0, (), (), (), original=True)]
-            analysis = Analysis(72, 0, clips, ())
+            clips = [Clip(0, 36, 0, (), (), ()), Clip(96, 120, 0, (), (), (), original=True)]
+            analysis = Analysis(132, 0, clips, ())
             section = director.ScriptSection("part-1", "La familia regresa.", ((0, 36, "Caption at 0.2s"),))
             doc = director.timeline_document(movie, clips, [section])
             self.assertEqual(director.import_timeline(doc, movie, analysis, min_gap=1), clips)

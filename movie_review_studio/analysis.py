@@ -1,4 +1,5 @@
 """Decode the entire source and index shot-contained edit candidates."""
+from bisect import bisect_right
 from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 import json
@@ -11,7 +12,7 @@ import numpy as np
 from scenedetect.detectors import ContentDetector
 
 from .media import Media, ffmpeg, frame_clock, identity, invoke, tool_path, video_seek
-from .model import Clip, MAX_CLIP_SECONDS, Signature, highlight_cuts, video_segments
+from .model import Clip, MAX_CLIP_SECONDS, Signature, adjacent_conflict, highlight_cuts, overlaps, validate
 
 WIDTH, HEIGHT = 320, 180
 FRAME_BYTES = WIDTH * HEIGHT * 3
@@ -183,9 +184,83 @@ def analyze(media: Media, cache: Path, progress) -> Analysis:
     return Analysis(count, offset, candidates, tuple(shot_starts))
 
 
+def cutaway_without_visible_speaker(media, clip, detector):
+    """Admit quiet-looking local scenery conservatively; never choose talking-head coverage."""
+    if detector.empty():
+        return False
+    indices = sorted({0, clip.frames // 2, clip.frames - 1})
+    select = "+".join(f"eq(n\\,{index})" for index in indices)
+    data = ffmpeg(*video_seek(media, clip.start), "-map", "0:v:0", "-an",
+                  "-vf", f"select={select},scale={WIDTH}:{HEIGHT}",
+                  "-frames:v", str(len(indices)), "-fps_mode", "passthrough", "-pix_fmt", "bgr24",
+                  "-f", "rawvideo", "-threads", "1", "pipe:1", binary=True)
+    if len(data) != FRAME_BYTES * len(indices):
+        return False
+    previous = None
+    for frame in np.frombuffer(data, dtype=np.uint8).reshape((-1, HEIGHT, WIDTH, 3)):
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        if len(detector.detectMultiScale(gray, 1.1, 4, minSize=(18, 18))):
+            return False
+        if previous is not None and np.mean(cv2.absdiff(gray, previous)) > 13:
+            return False
+        _, _, black, unusable, text = measure(frame, None)
+        if black or unusable or text > .55:
+            return False
+        previous = gray
+    return True
+
+
+def source_fragment(media, analysis, start, end, cache):
+    parent = next((c for c in analysis.candidates if c.start <= start < end <= c.end and c.shot is not None), None)
+    if parent is None:
+        raise ValueError("Picture range is not inside an analyzed source shot.")
+    return parent if (start, end) == (parent.start, parent.end) else fingerprint_highlight(
+        media, analysis, start, end, cache=cache, candidate=parent)
+
+
+def highlight_picture(media, analysis, start, end, cache, reserved, min_gap):
+    fps = media.fps
+    capacity = end - start
+    context = round(25 * fps)
+    selected = []
+    # A first matching picture can stay in lip sync. Every subsequent piece must be a local cutaway.
+    anchor = next((c for c in analysis.candidates if not c.production_card and c.shot is not None
+                   and c.start <= start < c.end), None)
+    if anchor is not None:
+        initial = source_fragment(media, analysis, start, min(end, anchor.end), cache)
+        if not any(overlaps(initial, clip) for clip in reserved):
+            selected.append(initial)
+            capacity -= initial.frames
+    if not capacity:
+        return tuple(selected)
+
+    detector = cv2.CascadeClassifier(str(Path(cv2.data.haarcascades) / "haarcascade_frontalface_default.xml"))
+    nearby = [c for c in analysis.candidates if not c.production_card and c.shot is not None
+              and (start - context <= c.start <= end + context)
+              and (c.end <= start or c.start >= end)]
+    nearby.sort(key=lambda c: (min(abs(c.start - start), abs(c.start - end)), -c.frames, -c.score))
+    for candidate in nearby:
+        if any(overlaps(candidate, c) for c in (*selected, *reserved)) or any(
+                candidate.shot == c.shot for c in selected):
+            continue
+        if selected and adjacent_conflict(selected[-1], candidate, fps, min_gap):
+            continue
+        if not cutaway_without_visible_speaker(replace(media, offset=analysis.offset), candidate, detector):
+            continue
+        piece = source_fragment(media, analysis, candidate.start, min(candidate.end, candidate.start + capacity), cache)
+        if selected and adjacent_conflict(selected[-1], piece, fps, min_gap):
+            continue
+        selected.append(piece)
+        capacity -= piece.frames
+        if not capacity:
+            return tuple(selected)
+    raise ValueError("No suitable non-adjacent picture for this original-audio range. Shorten it or choose a different source moment.")
+
+
 def fingerprint_highlight(media: Media, analysis: Analysis, start: int, end: int, *,
                           cache: Path | None = None, cuts: tuple[int, ...] | None = None,
-                          role: str = "", candidate: Clip | None = None) -> Clip:
+                          role: str = "", candidate: Clip | None = None, picture=None,
+                          reserved=(), min_gap=5) -> Clip:
     if candidate:
         if not candidate.start <= start < end <= candidate.end:
             raise ValueError("A fragment must stay inside its analyzed source shot.")
@@ -193,31 +268,35 @@ def fingerprint_highlight(media: Media, analysis: Analysis, start: int, end: int
         minimum, maximum = (1, 30) if role in {"Opening", "Ending"} else (1, 15) if role == "Highlight" else (10, 15)
         if not media.has_audio or not 0 <= start < end <= analysis.frames or not minimum <= (end - start) / media.fps <= maximum:
             raise ValueError(f"An original-audio group needs a {minimum}–{maximum} second source range.")
+        clip = Clip(start, end, 0, (), (), (), True, role=role)
+        if cuts is not None and picture is None:
+            # Open old projects with unresolved cuts visible. Every playback/render path audits these pieces.
+            legacy_cuts = cuts or highlight_cuts(start, end, media.fps, analysis.shot_starts)
+            return replace(clip, cuts=legacy_cuts, legacy_shots=tuple(
+                bisect_right(analysis.shot_starts, point) for point in (start, *legacy_cuts)))
+        fragments = (highlight_picture(media, analysis, start, end, cache, reserved, min_gap) if picture is None
+                     else tuple(source_fragment(media, analysis, a, b, cache) for a, b in picture))
+        clip = replace(clip, picture=fragments)
+        validate([clip], media.fps, analysis.frames, has_audio=media.has_audio, min_gap=min_gap)
+        return clip
+
     media = replace(media, offset=analysis.offset)
-    cuts = () if candidate else (highlight_cuts(start, end, media.fps, analysis.shot_starts) if cuts is None else cuts)
-    clip = replace(candidate, start=start, end=end) if candidate else Clip(start, end, 0, (), (), (), True, cuts=cuts, role=role)
-    parts = video_segments(clip, media.fps)
-    if any(not 0 < part.frames / media.fps <= MAX_CLIP_SECONDS for part in parts):
-        raise ValueError("Saved highlight segments must be contiguous and at most 5 seconds each.")
+    clip = replace(candidate, start=start, end=end)
     length = end - start
-    middle = np.linspace(0, length - 1, 5, dtype=int)
-    thumbnails = {part.start - start for part in parts} if cache else set()
+    middle = np.linspace(0, length - 1, min(5, length), dtype=int)
     edge = min(3, length)
-    indices = sorted(set(range(edge)) | set(range(length - edge, length)) | set(middle) | thumbnails)
+    indices = sorted(set(range(edge)) | set(range(length - edge, length)) | set(middle))
     select = "+".join(f"eq(n\\,{index})" for index in indices)
     data = ffmpeg(*video_seek(media, start), "-map", "0:v:0", "-an",
                   "-vf", f"select={select},scale={WIDTH}:{HEIGHT}",
                   "-frames:v", str(len(indices)), "-fps_mode", "passthrough", "-pix_fmt", "bgr24",
                   "-f", "rawvideo", "-threads", "1", "pipe:1", binary=True)
     if len(data) != FRAME_BYTES * len(indices):
-        raise RuntimeError("The decoder could not read the full highlight range.")
+        raise RuntimeError("The decoder could not read the requested source fragment.")
     frames = np.frombuffer(data, dtype=np.uint8).reshape((-1, HEIGHT, WIDTH, 3))
     fingerprints = {index: signature(frame) for index, frame in zip(indices, frames)}
     if cache:
-        key = identity(media.path)
-        for index, frame in zip(indices, frames):
-            if index in thumbnails:
-                save_thumbnail(cache, key, start + index, frame)
+        save_thumbnail(cache, identity(media.path), start, frames[0])
     return replace(clip, first=tuple(fingerprints[i] for i in range(edge)),
                    last=tuple(fingerprints[i] for i in range(length - edge, length)),
                    samples=tuple(fingerprints[i] for i in middle))

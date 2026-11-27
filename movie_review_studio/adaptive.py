@@ -72,7 +72,22 @@ def cinema(movie, analysis, evidence, cache, progress, settings, existing=(), sc
     available = [c for c in analysis.candidates if not c.production_card]
     starts = {c.start for c in available}
     by_start = {c.start: c for c in available}
-    marked = list(existing)
+    marked = []
+    for clip in existing:
+        try:
+            validate([clip], movie.fps, analysis.frames, has_audio=movie.has_audio, min_gap=min_gap)
+        except ValueError:
+            if clip.locked:
+                raise ValueError("Unlock the legacy original-audio group before rebuilding its picture.")
+            try:
+                repaired = fingerprint_highlight(movie, analysis, clip.start, clip.end, cache=cache, role=clip.role,
+                                                 reserved=marked, min_gap=min_gap)
+            except ValueError:
+                progress("Skipped legacy audio group: no suitable non-adjacent picture.")
+            else:
+                marked.append(replace(repaired, muted=clip.muted))
+        else:
+            marked.append(clip)
     sections = [("Opening", settings["opening"], 0.18, script[0].evidence if script else ()),
                 *[("Highlight", settings["length"], (i + 1) / (settings["count"] + 1), ())
                   for i in range(settings["count"])],
@@ -105,7 +120,16 @@ def cinema(movie, analysis, evidence, cache, progress, settings, existing=(), sc
         if candidates:
             _, start = max(candidates)
             progress(f"Preparing original audio · {role}")
-            marked.append(fingerprint_highlight(movie, analysis, start, start + length, cache=cache, role=role))
+            for _, start in sorted(candidates, reverse=True)[:6]:
+                try:
+                    group = fingerprint_highlight(movie, analysis, start, start + length, cache=cache, role=role,
+                                                  reserved=marked, min_gap=min_gap)
+                except ValueError:
+                    continue
+                marked.append(group)
+                break
+            else:
+                progress(f"Skipped {role.lower()}: no suitable non-adjacent picture.")
     return marked
 
 
@@ -181,7 +205,6 @@ def break_candidates(cuts, total, inserted, quiet, preferred, recording, fps):
     part_starts = [start for start, _, _ in recording.boundaries[1:]]
     # Original audio inserts shift the sub-frame audio clock by less than one sample per edit.
     # The final trial checks the exact count using the same frame-clock math as the renderer.
-    anchors = [preferred, *[round(Fraction(start, RATE) * fps) for start in part_starts]]
     radius = round(90 * fps)
     for low, high in quiet:
         begin = max(1, ceil(low / samples_per_frame) - 1)
@@ -191,18 +214,12 @@ def break_candidates(cuts, total, inserted, quiet, preferred, recording, fps):
         if begin > preferred + radius or end < preferred - radius:
             if not any(low - RATE <= start <= high + RATE for start in part_starts):
                 continue
-        nearest = min(end, max(begin, preferred))
-        candidates.update((begin, begin + 1, end, end - 1, nearest, nearest - 1, nearest + 1))
         first = bisect_left(cuts, begin)
         last = bisect_left(cuts, end + 1)
         candidates.update(cuts[first:last])
-        for anchor in anchors[1:]:
-            if begin <= anchor <= end:
-                candidates.add(anchor)
-    existing = set(cuts)
     previous = max(inserted, default=0)
     return sorted((frame for frame in candidates if previous < frame < total),
-                  key=lambda frame: (abs(frame - preferred), frame not in existing, frame))
+                  key=lambda frame: (abs(frame - preferred), frame))
 
 
 def insert_groups(body, opening, ending, groups, recording, quiet, movie, analysis, cache, min_gap, progress, notices):
@@ -227,23 +244,9 @@ def insert_groups(body, opening, ending, groups, recording, quiet, movie, analys
             candidates = [preferred] if preferred in candidates else []
         for frame in candidates:
             index = bisect_left(offsets, frame)
-            trial = body
             if offsets[index] != frame:
-                clip = body[index]
-                if clip.locked or clip.role:
-                    continue
-                boundary = clip.end - (offsets[index] - frame)
-                # Reject cheaply before decoding fresh fingerprints for the two sides.
-                first = replace(clip, end=boundary)
-                second = replace(clip, start=boundary)
-                if adjacent_conflict(first, group, fps, min_gap) or adjacent_conflict(group, second, fps, min_gap):
-                    continue
-                try:
-                    first = resized(movie, analysis, clip, clip.start, boundary, cache)
-                    second = resized(movie, analysis, clip, boundary, clip.end, cache)
-                except (OSError, RuntimeError, ValueError):
-                    continue
-                trial = [*body[:index], first, second, *body[index + 1:]]
+                continue
+            trial = body
             positions_by_frame = {**inserted, frame: group}
             proposed = candidate_picture(trial, positions_by_frame)
             _, capacity, boundaries = positions(proposed, fps)

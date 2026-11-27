@@ -190,10 +190,10 @@ def render(movie: Media, analysis: Analysis, clips: list[Clip], voice: Path | No
     if any(c.gap for c in clips):
         raise ValueError("Fill unresolved picture gaps before rendering.")
     validate(clips, movie.fps, analysis.frames, final=not preview and not fitted_duration, has_audio=movie.has_audio,
-             min_gap=min_gap, enforce_separation=not preview)
+             min_gap=min_gap)
     entries = timeline_entries(clips, movie.fps)
     identities = [identity(path) if path else None for path in (movie.path, voice, music)]
-    key_data = (VERSION, identities, [(c.start, c.end, c.highlight, c.cuts, c.original, c.muted, c.role) for c in clips],
+    key_data = (VERSION, identities, [(c.start, c.end, c.highlight, c.cuts, c.original, c.muted, c.role, [(part.start, part.end) for part in c.picture]) for c in clips],
                 (mix.original, mix.voice, mix.music) if mix else None)
     if managed_voice:
         key_data += ("managed-narration",)

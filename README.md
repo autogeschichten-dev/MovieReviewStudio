@@ -128,9 +128,11 @@ Run `RUN_AI_DIAGNOSTIC.bat` on Windows for the two known-image checks and a nati
 
 ### Source separation and validation report
 
-Both Fast Montage and AI Review check each join between separate edits, including joins between AI chapters. In **Export**, set **Minimum source separation** (default 5 seconds). A value of 0 still blocks touching source ranges. The rule measures the gap between source ranges in either order. Overlap, same-shot continuity, visual similarity, and the five-second fragment limit are also checked. The existing exception applies only to internal fragments of an explicitly designated original-audio highlight group. Its outer cuts obey the same rules as other edits.
+Fast Montage, AI Review, narration synchronization, preview and export validate every rendered picture fragment. The source separation setting has a five-second floor. The validator checks source shot identity, touching ranges, source overlap, visually similar neighbors, and individual durations. It checks internal picture cuts in opening, highlight, and ending groups as well as joins across groups or chapters.
 
-Projects save the separation setting. Older projects open for review and can be repaired one cut at a time. The Export workspace shows outstanding separation cuts. **Save timeline validation report…** writes a JSON report even when the timeline fails. A successful MP4 export also saves a `.timeline-validation.json` file next to the video with the policy, edit joins, source overlap pairs, fragment durations and ranges, and any highlight exceptions.
+Original-audio groups use a separate continuous audio range. Automatic selection starts with an in-sync source shot when available and fills the remainder with eligible nearby cutaways. When picture cannot be placed safely, the group is skipped or needs a shorter range. Automated cutaway screening uses sampled frames and cannot guarantee semantic relevance or detect every visible speaker.
+
+Old projects with contiguous highlight picture open for repair. Replace or remove those groups before playing or exporting the assembly. **Save timeline validation report…** lists unresolved fragments, source shots, source times, signed separation, audio mode and the repair status. Export saves the same audit next to the MP4.
 
 ### Multi-part voice-over
 

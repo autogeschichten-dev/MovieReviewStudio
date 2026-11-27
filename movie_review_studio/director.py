@@ -144,10 +144,16 @@ def timeline_document(movie, clips, sections=(), audio_files=None):
     for index, entry in enumerate(timeline_entries(clips, fps), 1):
         clip = entry.segment
         start, end = float(clip.start / fps), float(clip.end / fps)
-        rows.append({"id": f"v{index}", "source": "movie", "in": start, "out": end,
-                     "audio": "keep" if clip.movie_audio else "mute",
-                     "keep_windows": [[start, end]] if clip.movie_audio else [],
-                     "mrs_group": entry.edit_index if clip.highlight else None})
+        group = clips[entry.edit_index]
+        independent = bool(group.picture)
+        keep = clip.movie_audio and not independent
+        row = {"id": f"v{index}", "source": "movie", "in": start, "out": end,
+               "audio": "keep" if keep else "mute", "keep_windows": [[start, end]] if keep else [],
+               "mrs_group": entry.edit_index if clip.highlight else None}
+        if independent:
+            row.update(mrs_audio_frames=[group.start, group.end], mrs_audio_enabled=group.movie_audio,
+                       mrs_audio_role=group.role)
+        rows.append(row)
     linked = placements(sections, clips, fps)
     return {"schema_version": 3, "canvas": {"width": movie.width, "height": movie.height, "fps": str(fps)},
             "sources": {"movie": str(movie.path)}, "video": rows,
@@ -171,6 +177,7 @@ def import_timeline(document, movie, analysis, cache=None, *, min_gap=DEFAULT_SO
     spans, _ = timeline_video_spans(document)
     for group, items in groupby(spans, key=lambda span: span["clip"].get("mrs_group")):
         ranges = []
+        group_audio = []
         for span in items:
             if span["source"] != "movie" or not all(math.isfinite(span[key]) for key in ("in", "out")):
                 raise ValueError("The upstream timeline includes an invalid source or time.")
@@ -191,13 +198,16 @@ def import_timeline(document, movie, analysis, cache=None, *, min_gap=DEFAULT_SO
                     raise ValueError("Timeline contains an unknown shot.")
                 result.append(replace(clip, original=mode == "keep"))
             else:
-                ranges.append((start, end, mode))
+                ranges.append((start, end))
+                group_audio.append((row.get("mrs_audio_frames"), row.get("mrs_audio_enabled"),
+                                    row.get("mrs_audio_role", "")))
         if group is not None:
-            if len(ranges) < 2 or any(a[1] != b[0] or a[2] != b[2] for a, b in zip(ranges, ranges[1:])):
-                raise ValueError("Original-audio groups must contain continuous source footage and one audio mode.")
-            clip = fingerprint_highlight(movie, analysis, ranges[0][0], ranges[-1][1],
-                                         cuts=tuple(start for start, _, _ in ranges[1:]), cache=cache)
-            result.append(replace(clip, muted=ranges[0][2] == "mute"))
+            if not group_audio or not group_audio[0][0] or any(row != group_audio[0] for row in group_audio):
+                raise ValueError("Legacy contiguous highlight picture must be replaced before timeline import.")
+            (first, last), enabled, role = group_audio[0]
+            clip = fingerprint_highlight(movie, analysis, first, last, cache=cache, role=role, picture=ranges,
+                                         min_gap=min_gap)
+            result.append(replace(clip, muted=not enabled))
     validate(result, movie.fps, analysis.frames, has_audio=movie.has_audio, min_gap=min_gap)
     return result
 

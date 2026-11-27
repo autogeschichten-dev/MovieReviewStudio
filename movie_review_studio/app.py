@@ -28,7 +28,7 @@ from .media import Cancelled, cancellation, identity, inspect, invoke
 from . import adaptive, director, local_ai, narration
 from .ai_settings import AISettingsDialog, model_choices, settings
 from .editor import SceneModel, Timeline, TrackLabels, thumbnail
-from .model import (DEFAULT_SOURCE_GAP, adjacent_conflict, overlaps, replacement, separation_issues,
+from .model import (DEFAULT_SOURCE_GAP, adjacent_conflict, overlaps, replacement, fragment_issues,
                     timeline_entries, timeline_validation_report, validate)
 from .render import Mix, render, render_selection
 from .smart import AudioEvidence, LocalWhisper, assemble, audio_evidence, suggest_highlights
@@ -1009,7 +1009,7 @@ class Studio(QMainWindow):
         layout.addWidget(self.final_summary)
         gap_form = QFormLayout()
         self.source_gap = QSpinBox()
-        self.source_gap.setRange(0, 120)
+        self.source_gap.setRange(5, 120)
         self.source_gap.setValue(DEFAULT_SOURCE_GAP)
         self.source_gap.setSuffix(" s")
         self.source_gap.setToolTip("Required source-time gap between consecutive separate edits. Touching ranges are always blocked.")
@@ -1430,8 +1430,11 @@ class Studio(QMainWindow):
         if previous and previous.locked:
             raise ValueError("Unlock this clip before changing it.")
         role = previous.role if previous else "Highlight"
-        self.background("Reading highlight frames…",
-                        lambda _: fingerprint_highlight(self.movie, self.analysis, start, end, cache=self.cache, role=role),
+        reserved = [clip for clip in self.clips if clip != previous and not clip.gap]
+        gap = self.source_gap.value()
+        self.background("Selecting independent highlight picture…",
+                        lambda _: fingerprint_highlight(self.movie, self.analysis, start, end, cache=self.cache, role=role,
+                                                        reserved=reserved, min_gap=gap),
                         lambda clip: self.apply_highlight(index, clip))
 
     def apply_highlight(self, index, clip):
@@ -1670,11 +1673,20 @@ class Studio(QMainWindow):
     def check(self, clips, final=False, *, preview=False):
         fps = self.movie.fps
         gap = self.source_gap.value()
-        # Earlier edits can remain previewable and be repaired incrementally.
-        enforce = final or not (preview or
-            separation_issues(clips, fps, gap).keys() <= separation_issues(self.clips, fps, gap).keys())
-        validate(clips, fps, self.analysis.frames, final=final and not self.fitted_narration(), has_audio=self.movie.has_audio,
-                 min_gap=gap, enforce_separation=enforce)
+        try:
+            validate(clips, fps, self.analysis.frames, final=final and not self.fitted_narration(),
+                     has_audio=self.movie.has_audio, min_gap=gap)
+        except ValueError:
+            if final or preview:
+                raise
+            # Old invalid projects can be repaired incrementally, but remain blocked for all output.
+            def keys(edits):
+                return {(row["reason"], tuple((side["source_start_frame"], side["source_end_frame"])
+                            for side in (row["left"], row["right"]) if side))
+                        for row in fragment_issues(edits, fps, self.analysis.frames, gap)}
+            after, before = keys(clips), keys(self.clips)
+            if not after or not after < before:
+                raise
 
     def selected_row(self):
         index = self.selected_clip_row
@@ -1891,8 +1903,7 @@ class Studio(QMainWindow):
         if not entry.segment.start < point < entry.segment.end:
             raise ValueError("The selected fragment is too short to split.")
         if clip.highlight:
-            changed = replace(clip, cuts=tuple(sorted((*clip.cuts, point))))
-            self.apply_highlight(self.highlights.index(clip), changed)
+            raise ValueError("Replace the original-audio group to choose independent picture fragments.")
         else:
             self.background("Splitting source fragment…",
                         lambda _: adaptive.resized(self.movie, self.analysis, clip, clip.start, point, self.cache),
@@ -2210,14 +2221,16 @@ class Studio(QMainWindow):
         self.final_summary.setText(f"{len(entries)} video segments · {clock(cursor / movie.fps if movie else 0)}\n"
                                    f"{sum(clip.highlight and clip.movie_audio for clip in self.clips)} original-audio highlights in timeline\n"
                                    "H.264 video · AAC stereo · MP4")
+        conflicts = 0
         if movie and self.clips:
-            conflicts = len(separation_issues(self.clips, movie.fps, self.source_gap.value()))
+            conflicts = len(fragment_issues(self.clips, movie.fps, self.analysis.frames, self.source_gap.value()))
             if conflicts:
                 self.final_summary.setText(self.final_summary.text() + f"\n{conflicts} source separation cuts to repair before export.")
         gaps = sum(c.gap for c in self.clips)
         if gaps:
             self.final_summary.setText(self.final_summary.text() + f"\n{gaps} unresolved picture gaps.")
-        self.export_button.setEnabled(bool(self.clips) and not gaps)
+        self.export_button.setEnabled(bool(self.clips) and not gaps and not conflicts)
+        self.total_label.setText(f"{self.total_label.text()} · {conflicts} visual violations")
 
     def save_project(self):
         self.require_movie(True)
@@ -2228,7 +2241,7 @@ class Studio(QMainWindow):
         self.check_output_path(destination)
         linked = director.placements(self.script, self.clips, self.movie.fps)
         atomic_json(destination, {
-            "version": 4, "duration_mode": self.duration_mode, "cinema": self.cinema_settings,
+            "version": 5, "duration_mode": self.duration_mode, "cinema": self.cinema_settings,
             "minimum_source_gap_seconds": self.source_gap.value(), "director": {"sections": [dict(s.json_row(), placements=linked[s.id]) for s in self.script],
                                         "approved": self.script_approved, "mode": self.director_mode,
                                         "language": self.director_language, "generated_voice": str(self.generated_voice) if self.generated_voice else None},
@@ -2239,7 +2252,8 @@ class Studio(QMainWindow):
                               "captions": str(self.voice_captions) if self.voice_captions else None,
                               "sync": self.voice_sync},
             "title": self.title.text(), "year": self.year.value(), "target": self.target.value(),
-            "highlights": [[c.start, c.end, list(c.cuts), c.muted, c.role] + ([True] if c.locked else []) for c in self.highlights],
+            "highlights": [[c.start, c.end, list(c.cuts), c.muted, c.role, c.locked,
+                            [[part.start, part.end] for part in c.picture]] for c in self.highlights],
             "clips": [[c.start, c.end, c.highlight, c.original, c.role] + ([c.locked, c.gap] if c.locked or c.gap else []) for c in self.clips],
         })
         self.statusBar().showMessage(f"Saved edit to {destination}")
@@ -2255,7 +2269,7 @@ class Studio(QMainWindow):
 
         def load(progress):
             payload = json.loads(Path(path).read_text(encoding="utf-8"))
-            if payload["version"] not in (1, 2, 3, 4):
+            if payload["version"] not in (1, 2, 3, 4, 5):
                 raise ValueError("Unsupported edit file version.")
             movie = inspect(Path(payload["movie"]))
             if identity(movie.path) != payload["source_key"]:
@@ -2263,8 +2277,9 @@ class Studio(QMainWindow):
             analysis = analyze(movie, self.cache, progress)
             highlights = [
                 replace(fingerprint_highlight(movie, analysis, *item[:2], cache=self.cache,
-                                              cuts=tuple(item[2]) if len(item) > 2 else None,
-                                              role=item[4] if len(item) > 4 else ""),
+                                              cuts=tuple(item[2]) if len(item) > 2 else (),
+                                              role=item[4] if len(item) > 4 else "",
+                                              picture=item[6] if len(item) > 6 and item[6] else None),
                         muted=item[3] if len(item) > 3 else False, role=item[4] if len(item) > 4 else "",
                         locked=bool(item[5]) if len(item) > 5 else False)
                 for item in payload["highlights"]
@@ -2288,7 +2303,14 @@ class Studio(QMainWindow):
                 clips.append(replace(clip, original=bool(item[3]) if len(item) > 3 else False,
                                      role=item[4] if len(item) > 4 else "", locked=locked or clip.locked))
             if clips:
-                validate(clips, movie.fps, analysis.frames, has_audio=movie.has_audio, enforce_separation=False)
+                gap = max(DEFAULT_SOURCE_GAP, payload.get("minimum_source_gap_seconds", DEFAULT_SOURCE_GAP))
+                issues = fragment_issues(clips, movie.fps, analysis.frames, gap)
+                try:
+                    validate(clips, movie.fps, analysis.frames, has_audio=movie.has_audio, min_gap=gap)
+                except ValueError:
+                    if not issues:
+                        raise
+                    progress(f"Opened for repair: {len(issues)} strict picture violations block playback and export.")
             ordered = sorted(highlights, key=lambda clip: clip.start)
             if sum(c.role not in {"Opening", "Ending"} for c in ordered) > 3 or any(a.end > b.start for a, b in zip(ordered, ordered[1:])):
                 raise ValueError("The saved highlights overlap or exceed the limit of three.")
@@ -2403,8 +2425,8 @@ class Studio(QMainWindow):
 
     def export(self):
         self.require_movie(True)
-        self.check_managed_narration(final=True)
         self.check(self.clips, final=True)
+        self.check_managed_narration(final=True)
         path, _ = QFileDialog.getSaveFileName(self, "Export review", "Movie Review.mp4", "MP4 video (*.mp4)")
         if not path:
             return

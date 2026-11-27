@@ -2,6 +2,8 @@ from dataclasses import replace
 from fractions import Fraction
 import unittest
 
+from strict_fixtures import audio_group
+
 from movie_review_studio.model import Clip, Signature, adjacent_conflict, choose, replacement, timeline_entries, validate
 
 
@@ -50,8 +52,7 @@ class MontageTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "needs movie audio"):
             validate([clip(0, 10, highlight=True)], Fraction(1), 100, has_audio=False)
         with self.assertRaisesRegex(ValueError, "16–18"):
-            validate([clip(0, 10, image=10, highlight=True), clip(20, 10, image=150, highlight=True)],
-                     Fraction(1), 100, final=True)
+            validate([clip(0), clip(20, image=150)], Fraction(1), 100, final=True)
 
     def test_fractional_rate_highlight_never_rounds_past_five_seconds(self):
         fps = Fraction(24000, 1001)
@@ -60,14 +61,15 @@ class MontageTests(unittest.TestCase):
         self.assertEqual([(entry.segment.start, entry.segment.end) for entry in entries],
                          [(17, 97), (97, 177), (177, 257)])
         self.assertTrue(all(entry.segment.frames / fps <= 5 for entry in entries))
-        with self.assertRaisesRegex(ValueError, "invalid segment"):
+        with self.assertRaisesRegex(ValueError, "exceeds 5"):
             validate([replace(highlight, cuts=(137,))], fps, 300)
 
     def test_generation_creates_one_valid_full_timeline(self):
-        candidates = [clip(index * 6, image=index * 101 % 256) for index in range(300)]
-        highlights = [clip(500, 12, 15, True), clip(1500, 12, 220, True)]
-        result = choose(candidates, highlights, Fraction(1), 1800, 1020)
-        validate(result, Fraction(1), 1800, final=True)
+        candidates = [clip(index * 11, image=index * 101 % 256) for index in range(300)]
+        highlights = [audio_group(clip(3325, 12, 15, True), [(3325, 3330), (3335, 3340), (3345, 3347)]),
+                      audio_group(clip(3360, 12, 220, True), [(3360, 3365), (3370, 3375), (3380, 3382)])]
+        result = choose(candidates, highlights, Fraction(1), 3400, 1020)
+        validate(result, Fraction(1), 3400, final=True)
         self.assertTrue(1020 <= sum(item.frames for item in result) < 1025)
         self.assertEqual([item for item in result if item.highlight], highlights)
         for conflict in zip(result, result[1:]):

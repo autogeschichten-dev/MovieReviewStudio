@@ -8,6 +8,8 @@ import unittest
 from unittest.mock import patch
 import wave
 
+from strict_fixtures import audio_group
+
 from movie_review_studio import adaptive, narration
 from movie_review_studio.media import ffmpeg, identity, inspect
 from movie_review_studio.model import Clip, timeline_entries, validate
@@ -29,6 +31,9 @@ class AdaptiveClockTests(unittest.TestCase):
                 first = [clip(30 + 13 * i) for i in range(half // 5 + 1)]
                 second = [clip(5500 + 13 * i) for i in range(half // 5 + 1)]
                 opening, highlight, ending = clip(0, 10, "Opening"), clip(4500, 12, "Highlight"), clip(8500, 10, "Ending")
+                opening = audio_group(opening, [(0, 5), (13, 18)])
+                highlight = audio_group(highlight, [(4500, 4505), (4510, 4515), (4520, 4522)])
+                ending = audio_group(ending, [(8500, 8505), (8510, 8515)])
                 edits = [opening, *first, highlight, *second, ending]
                 recording = narration.Recording(Path("timing-fixture"), seconds * RATE, ())
                 with patch.object(adaptive, "quiet_ranges", return_value=[((half - 1) * RATE, half * RATE)]):
@@ -45,7 +50,7 @@ class AdaptiveClockTests(unittest.TestCase):
     def test_unresolved_gap_and_adjacent_split_rejected_for_export(self):
         first = clip(20)
         second = replace(clip(25), shot=first.shot)
-        with self.assertRaisesRegex(ValueError, "continuous source shot"):
+        with self.assertRaisesRegex(ValueError, "touch in the source"):
             validate([first, second], Fraction(1), 100)
         with self.assertRaisesRegex(ValueError, "unresolved picture gaps"):
             validate([first, adaptive.placeholder(second)], Fraction(1), 100, final=True)

@@ -19,8 +19,8 @@ permissions:
 env:
   ZIP_NAME: MovieReviewStudio-Windows-x64.zip
   RELEASE_TAG: ${{ inputs.release_tag || github.ref_name }}
-  REUSE_WINDOWS_MEDIA: ${{ startsWith(inputs.release_tag || github.ref_name, 'stage3-windows-v3.0.') || startsWith(inputs.release_tag || github.ref_name, 'stage3-windows-v3.1.') || startsWith(inputs.release_tag || github.ref_name, 'stage3-windows-v3.3.') }}
-  REUSE_LAME_MEDIA: ${{ startsWith(inputs.release_tag || github.ref_name, 'stage3-windows-v3.3.') }}
+  REUSE_WINDOWS_MEDIA: ${{ startsWith(inputs.release_tag || github.ref_name, 'stage3-windows-v3.0.') || startsWith(inputs.release_tag || github.ref_name, 'stage3-windows-v3.1.') || (startsWith(inputs.release_tag || github.ref_name, 'stage3-windows-v3.3.') || startsWith(inputs.release_tag || github.ref_name, 'stage3-windows-v3.4.')) }}
+  REUSE_LAME_MEDIA: ${{ (startsWith(inputs.release_tag || github.ref_name, 'stage3-windows-v3.3.') || startsWith(inputs.release_tag || github.ref_name, 'stage3-windows-v3.4.')) }}
 
 jobs:
   build:
@@ -198,6 +198,8 @@ jobs:
             title="Movie Review Studio V3.3.1 — Planning Recovery Hotfix"
           elif [[ "$RELEASE_TAG" == "stage3-windows-v3.3.2" ]]; then
             title="Movie Review Studio V3.3.2 — Narration-First Synchronization"
+          elif [[ "$RELEASE_TAG" == "stage3-windows-v3.4.0" ]]; then
+            title="Movie Review Studio V3.4.0 — Strict Global Fragment Validation"
           fi
           gh release create "$RELEASE_TAG" "$ZIP_NAME" \
             --repo "$GITHUB_REPOSITORY" --verify-tag \
