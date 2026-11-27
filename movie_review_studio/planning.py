@@ -14,7 +14,7 @@ import re
 from .analysis import atomic_json
 from .timing_json import exact
 from . import local_ai
-from .model import DEFAULT_SOURCE_GAP, adjacent_conflict, validate
+from .model import FIXED_GENERATION_MIN_SECONDS, FIXED_MAX_SECONDS, DEFAULT_SOURCE_GAP, adjacent_conflict, validate
 from .recap_upstream import render as recap_render
 
 VERSION = 2
@@ -267,7 +267,7 @@ def fit_route(route, chapters, budgets, model_ids, fps, min_gap, goal, minimum):
             after = total - clip.frames
             if sid is None or after < minimum:
                 continue
-            if total <= int(1080 * fps) and abs(after - goal) > total - goal:
+            if total <= int(FIXED_MAX_SECONDS * fps) and abs(after - goal) > total - goal:
                 continue
             if 0 < i < len(route) - 1:
                 left, right = route[i - 1][0], route[i + 1][0]
@@ -362,7 +362,7 @@ def plan(movie, analysis, highlights, provider, mode, language, target, custom, 
     # Use legacy evidence normalization for the checkpoint key and chapter positions.
     # Stricter filters affect only outgoing evidence and candidate eligibility.
     shots = registry(clips, observations, movie, analysis.frames, legacy=True)
-    goal = math.ceil(target * movie.fps) if adaptive else min(int(1080 * movie.fps), round(target * movie.fps))
+    goal = math.ceil(target * movie.fps) if adaptive else min(int(FIXED_MAX_SECONDS * movie.fps), round(target * movie.fps))
     remaining = goal - sum(clip.frames for clip in highlights)
     report = report or cache / "ai-planning-diagnostic.jsonl"
     planner = TextPlanner(provider, report)
@@ -507,8 +507,8 @@ def plan(movie, analysis, highlights, provider, mode, language, target, custom, 
         # Individual highlights must be valid; other clips can bridge their cuts.
         for highlight in picked:
             validate([highlight], movie.fps, analysis.frames, has_audio=movie.has_audio, min_gap=min_gap)
-    minimum = goal if adaptive else max(math.ceil(1020 * movie.fps), goal - int(5 * movie.fps))
-    hard_limit = goal + math.ceil(5 * movie.fps) if adaptive else int(1080 * movie.fps)
+    minimum = goal if adaptive else max(math.ceil(FIXED_GENERATION_MIN_SECONDS * movie.fps), goal - int(5 * movie.fps))
+    hard_limit = goal + math.ceil(5 * movie.fps) if adaptive else int(FIXED_MAX_SECONDS * movie.fps)
     chapter_rows = []
     total_weight = sum(shot.clip.frames for shot in ordered)
     picture_budget = max(0, remaining)

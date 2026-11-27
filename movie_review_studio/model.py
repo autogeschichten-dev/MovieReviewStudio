@@ -8,6 +8,33 @@ import numpy as np
 
 MAX_CLIP_SECONDS = 5
 DEFAULT_SOURCE_GAP = 5
+FIXED_MIN_SECONDS = 960
+FIXED_GENERATION_MIN_SECONDS = 1020
+FIXED_MAX_SECONDS = 1080
+NARRATION_SAMPLE_RATE = 48000
+
+
+def narration_frames(samples, fps):
+    return ceil(Fraction(samples, NARRATION_SAMPLE_RATE) * fps)
+
+
+def adaptive_frames(clips, fps, samples):
+    return narration_frames(samples, fps) + sum(clip.frames for clip in clips if clip.movie_audio)
+
+
+def validate_duration(clips, fps, *, narration_samples=None):
+    frames = sum(clip.frames for clip in clips)
+    if narration_samples is not None:
+        expected = adaptive_frames(clips, fps, narration_samples)
+        if frames != expected:
+            raise ValueError("The picture duration does not match the recording and enabled original audio. Run Merge & Synchronize.")
+    elif not FIXED_MIN_SECONDS <= frames / fps <= FIXED_MAX_SECONDS:
+        raise ValueError("The final montage must be 16–18 minutes including highlights.")
+
+
+def has_picture_gap(clips):
+    return any(clip.gap or any(part.gap for part in clip.picture) for clip in clips)
+
 
 
 @dataclass(frozen=True)
@@ -209,11 +236,13 @@ def fragment_issues(clips, fps, source_frames, min_gap=DEFAULT_SOURCE_GAP):
 
 
 def validate(clips: list[Clip], fps: Fraction, source_frames: int, *,
-             final: bool = False, has_audio: bool = True, min_gap: int = DEFAULT_SOURCE_GAP) -> None:
+             final: bool = False, has_audio: bool = True, min_gap: int = DEFAULT_SOURCE_GAP, narration_samples=None) -> None:
     if min_gap < 0:
         raise ValueError("Minimum source separation cannot be negative.")
     if not clips:
         raise ValueError("The timeline is empty.")
+    if final and has_picture_gap(clips):
+        raise ValueError("Fill unresolved picture gaps before export.")
     highlights = 0
     roles = set()
     for index, clip in enumerate(clips):
@@ -236,7 +265,7 @@ def validate(clips: list[Clip], fps: Fraction, source_frames: int, *,
             low, high = (1, 30) if cinematic else (1, 15) if clip.role == "Highlight" else (10, 15)
             if not has_audio or not low <= duration <= high:
                 raise ValueError(f"Highlight {number} needs movie audio and a length of {low}–{high} seconds.")
-            if clip.picture and (any(part.highlight or part.picture or part.gap or part.shot is None for part in clip.picture)
+            if clip.picture and (any(part.highlight or part.picture or (not part.gap and part.shot is None) for part in clip.picture)
                                  or sum(part.frames for part in clip.picture) != clip.frames):
                 raise ValueError(f"Original-audio group {number} needs identified picture fragments matching its audio duration.")
     issues = fragment_issues(clips, fps, source_frames, min_gap)
@@ -251,18 +280,19 @@ def validate(clips: list[Clip], fps: Fraction, source_frames: int, *,
         raise ValueError(f"Fragment {left['fragment_id']} lies outside the source.")
     if highlights > 3:
         raise ValueError("The montage supports up to three original-audio highlight groups.")
-    if final and not 960 <= sum(clip.frames for clip in clips) / fps <= 1080:
-        raise ValueError("The final montage must be 16–18 minutes including highlights.")
+    if final:
+        validate_duration(clips, fps, narration_samples=narration_samples)
 
 
 def timeline_validation_report(clips, fps, source_frames, *, has_audio=True, min_gap=DEFAULT_SOURCE_GAP,
-                               fitted_duration=False):
+                               fitted_duration=False, narration_samples=None):
     entries = timeline_entries(clips, fps)
     issues = fragment_issues(clips, fps, source_frames, min_gap)
     try:
-        if any(c.gap for c in clips):
+        if has_picture_gap(clips):
             raise ValueError("Fill unresolved picture gaps before export.")
-        validate(clips, fps, source_frames, final=not fitted_duration, has_audio=has_audio, min_gap=min_gap)
+        validate(clips, fps, source_frames, final=narration_samples is not None or not fitted_duration,
+                 has_audio=has_audio, min_gap=min_gap, narration_samples=narration_samples)
     except ValueError as error:
         failure = str(error)
     else:
@@ -270,7 +300,7 @@ def timeline_validation_report(clips, fps, source_frames, *, has_audio=True, min
     overlapping = [[row["left"]["edit"], row["right"]["edit"]] for row in issues if row["reason"] == "overlap"]
     return {"passed": failure is None, "overlapping_edits": overlapping, "first_error": failure,
             "source_fps": str(fps), "minimum_source_gap_seconds": max(DEFAULT_SOURCE_GAP, min_gap),
-            "maximum_fragment_seconds": MAX_CLIP_SECONDS, "duration_fitted_to_narration": fitted_duration,
+            "maximum_fragment_seconds": MAX_CLIP_SECONDS, "duration_fitted_to_narration": fitted_duration or narration_samples is not None,
             "duration_seconds": float(sum(clip.frames for clip in clips) / fps), "violations": issues,
             "adjacent_source_fragment_violations": len({(row["left"]["fragment_id"], row["right"]["fragment_id"])
                                                        for row in issues if row["reason"] in CUT_MESSAGES
@@ -288,7 +318,7 @@ def timeline_validation_report(clips, fps, source_frames, *, has_audio=True, min
 
 def choose(candidates: list[Clip], highlights: list[Clip], fps: Fraction,
            source_frames: int, target_seconds: int, rank: ClipRanker | None = None, *, min_gap=DEFAULT_SOURCE_GAP) -> list[Clip]:
-    if not 2 <= len(highlights) <= 3 or not 960 <= target_seconds <= 1080:
+    if not 2 <= len(highlights) <= 3 or not FIXED_MIN_SECONDS <= target_seconds <= FIXED_MAX_SECONDS:
         raise ValueError("Select 2–3 highlights and a target of 16–18 minutes.")
     rank = rank or (lambda clip: clip.score)
     lanes: list[list[Clip]] = [[] for _ in range(12)]
@@ -298,8 +328,8 @@ def choose(candidates: list[Clip], highlights: list[Clip], fps: Fraction,
     result: list[Clip] = []
     remaining = sorted(highlights, key=lambda clip: clip.start)
     total = 0
-    target = min(int(1080 * fps), ceil(target_seconds * fps))
-    maximum = int(1080 * fps)
+    target = min(int(FIXED_MAX_SECONDS * fps), ceil(target_seconds * fps))
+    maximum = int(FIXED_MAX_SECONDS * fps)
     lane_number = 0
     while total < target or remaining:
         previous = result[-1] if result else None
@@ -333,7 +363,7 @@ def choose(candidates: list[Clip], highlights: list[Clip], fps: Fraction,
                     break
         result.append(selected)
         total += selected.frames
-    if remaining or total < ceil(960 * fps):
+    if remaining or total < ceil(FIXED_MIN_SECONDS * fps):
         raise ValueError("There is insufficient distinct usable footage to build a valid 16-minute montage.")
     validate(result, fps, source_frames, final=True, min_gap=min_gap)
     return result

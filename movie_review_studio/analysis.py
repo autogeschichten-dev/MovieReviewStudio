@@ -218,10 +218,9 @@ def source_fragment(media, analysis, start, end, cache):
         media, analysis, start, end, cache=cache, candidate=parent)
 
 
-def highlight_picture(media, analysis, start, end, cache, reserved, min_gap):
+def highlight_picture(media, analysis, start, end, cache, reserved, min_gap, screened=None):
     fps = media.fps
     capacity = end - start
-    context = round(25 * fps)
     selected = []
     # A first matching picture can stay in lip sync. Every subsequent piece must be a local cutaway.
     anchor = next((c for c in analysis.candidates if not c.production_card and c.shot is not None
@@ -234,33 +233,54 @@ def highlight_picture(media, analysis, start, end, cache, reserved, min_gap):
     if not capacity:
         return tuple(selected)
 
+    if screened is None:
+        screened = {}
     detector = cv2.CascadeClassifier(str(Path(cv2.data.haarcascades) / "haarcascade_frontalface_default.xml"))
+    media = replace(media, offset=analysis.offset)
+    # Prefer local cutaways, then widen to the surrounding sequence while keeping speaker screening.
+    context = round(45 * fps)
     nearby = [c for c in analysis.candidates if not c.production_card and c.shot is not None
-              and (start - context <= c.start <= end + context)
-              and (c.end <= start or c.start >= end)]
+              and start - context <= c.start <= end + context and (c.end <= start or c.start >= end)
+              and not any(overlaps(c, clip) for clip in reserved)]
     nearby.sort(key=lambda c: (min(abs(c.start - start), abs(c.start - end)), -c.frames, -c.score))
-    for candidate in nearby:
-        if any(overlaps(candidate, c) for c in (*selected, *reserved)) or any(
-                candidate.shot == c.shot for c in selected):
-            continue
-        if selected and adjacent_conflict(selected[-1], candidate, fps, min_gap):
-            continue
-        if not cutaway_without_visible_speaker(replace(media, offset=analysis.offset), candidate, detector):
-            continue
-        piece = source_fragment(media, analysis, candidate.start, min(candidate.end, candidate.start + capacity), cache)
-        if selected and adjacent_conflict(selected[-1], piece, fps, min_gap):
-            continue
-        selected.append(piece)
-        capacity -= piece.frames
-        if not capacity:
-            return tuple(selected)
+    # Try multiple cut chains. A locally attractive shot can prevent a later safe cut.
+    budget = 320
+
+    def chain(picture, remaining):
+        nonlocal budget
+        if not remaining:
+            return tuple(picture)
+        for candidate in nearby[:32]:
+            if budget <= 0:
+                break
+            if any(candidate.shot == used.shot for used in picture):
+                continue
+            if picture and adjacent_conflict(picture[-1], candidate, fps, min_gap):
+                continue
+            key = candidate.start, candidate.end
+            if key not in screened:
+                screened[key] = cutaway_without_visible_speaker(media, candidate, detector)
+            if not screened[key]:
+                continue
+            budget -= 1
+            piece = source_fragment(media, analysis, candidate.start, min(candidate.end, candidate.start + remaining), cache)
+            if picture and adjacent_conflict(picture[-1], piece, fps, min_gap):
+                continue
+            result = chain([*picture, piece], remaining - piece.frames)
+            if result:
+                return result
+        return None
+
+    result = chain(selected, capacity)
+    if result:
+        return result
     raise ValueError("No suitable non-adjacent picture for this original-audio range. Shorten it or choose a different source moment.")
 
 
 def fingerprint_highlight(media: Media, analysis: Analysis, start: int, end: int, *,
                           cache: Path | None = None, cuts: tuple[int, ...] | None = None,
                           role: str = "", candidate: Clip | None = None, picture=None,
-                          reserved=(), min_gap=5) -> Clip:
+                          reserved=(), min_gap=5, screened=None) -> Clip:
     if candidate:
         if not candidate.start <= start < end <= candidate.end:
             raise ValueError("A fragment must stay inside its analyzed source shot.")
@@ -274,8 +294,9 @@ def fingerprint_highlight(media: Media, analysis: Analysis, start: int, end: int
             legacy_cuts = cuts or highlight_cuts(start, end, media.fps, analysis.shot_starts)
             return replace(clip, cuts=legacy_cuts, legacy_shots=tuple(
                 bisect_right(analysis.shot_starts, point) for point in (start, *legacy_cuts)))
-        fragments = (highlight_picture(media, analysis, start, end, cache, reserved, min_gap) if picture is None
-                     else tuple(source_fragment(media, analysis, a, b, cache) for a, b in picture))
+        fragments = (highlight_picture(media, analysis, start, end, cache, reserved, min_gap, screened) if picture is None
+                     else tuple(Clip(row[0], row[1], 0, (), (), (), gap=True) if len(row) > 2 and row[2]
+                                else source_fragment(media, analysis, row[0], row[1], cache) for row in picture))
         clip = replace(clip, picture=fragments)
         validate([clip], media.fps, analysis.frames, has_audio=media.has_audio, min_gap=min_gap)
         return clip

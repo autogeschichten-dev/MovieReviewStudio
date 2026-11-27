@@ -19,7 +19,7 @@ import wave
 
 from .analysis import atomic_json, fingerprint_highlight
 from .media import ffmpeg, identity
-from .model import DEFAULT_SOURCE_GAP, adjacent_conflict, overlaps, timeline_entries, validate
+from .model import FIXED_GENERATION_MIN_SECONDS, FIXED_MAX_SECONDS, DEFAULT_SOURCE_GAP, adjacent_conflict, overlaps, timeline_entries, validate
 from .recap_upstream._common import timeline_video_spans
 from .recap_upstream import check, frames, probe, render as recap_render, transcribe, tts
 
@@ -255,7 +255,7 @@ def plan(movie, analysis, highlights, provider, mode, language, target, custom, 
         transcript = read_transcript(movie, cache, progress)
     candidates = [c for c in analysis.candidates if not c.production_card and
                   not any(overlaps(c, h) for h in highlights)]
-    goal = min(int(1080 * movie.fps), round(target * movie.fps))
+    goal = math.ceil(target * movie.fps) if adaptive else min(int(FIXED_MAX_SECONDS * movie.fps), round(target * movie.fps))
     remaining = goal - sum(c.frames for c in highlights)
     if observations is None and sum(c.frames for c in candidates) < remaining:
         raise ValueError("The source has insufficient usable footage for the requested review duration.")
@@ -368,7 +368,7 @@ def plan(movie, analysis, highlights, provider, mode, language, target, custom, 
                 continue
             if at + 1 < len(neighbors) and adjacent_conflict(clip, neighbors[at + 1], movie.fps, min_gap):
                 continue
-            if used_frames + clip.frames > remaining + min(int(5 * movie.fps), int(1080 * movie.fps) - goal):
+            if used_frames + clip.frames > remaining + (0 if adaptive else min(int(5 * movie.fps), int(FIXED_MAX_SECONDS * movie.fps) - goal)):
                 continue
             used.append((clip.start, clip.end, choices[shot_id]))
             used_frames += clip.frames
@@ -387,9 +387,9 @@ def plan(movie, analysis, highlights, provider, mode, language, target, custom, 
             sections.append(ScriptSection(section_id, commentary.strip(), tuple(used), alternatives))
         remaining -= used_frames
     duration = sum(c.frames for c in all_clips) / movie.fps
-    if not 1020 <= duration <= 1080 or remaining > 5 * movie.fps:
+    if (not adaptive and not FIXED_GENERATION_MIN_SECONDS <= duration <= FIXED_MAX_SECONDS) or remaining > 5 * movie.fps:
         raise ValueError("The director did not find enough grounded footage to meet the target. Fast Montage remains available.")
-    validate(all_clips, movie.fps, analysis.frames, final=True, has_audio=movie.has_audio, min_gap=min_gap)
+    validate(all_clips, movie.fps, analysis.frames, final=not adaptive, has_audio=movie.has_audio, min_gap=min_gap)
     recap_render.validate_timeline_physical(timeline_document(movie, all_clips, sections), strict=True)
     return all_clips, sections
 

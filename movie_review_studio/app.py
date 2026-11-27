@@ -28,7 +28,7 @@ from .media import Cancelled, cancellation, identity, inspect, invoke
 from . import adaptive, director, local_ai, narration
 from .ai_settings import AISettingsDialog, model_choices, settings
 from .editor import SceneModel, Timeline, TrackLabels, thumbnail
-from .model import (DEFAULT_SOURCE_GAP, adjacent_conflict, overlaps, replacement, fragment_issues,
+from .model import (DEFAULT_SOURCE_GAP, FIXED_GENERATION_MIN_SECONDS, FIXED_MAX_SECONDS, has_picture_gap, adjacent_conflict, overlaps, replacement, fragment_issues,
                     timeline_entries, timeline_validation_report, validate)
 from .render import Mix, render, render_selection
 from .smart import AudioEvidence, LocalWhisper, assemble, audio_evidence, suggest_highlights
@@ -286,10 +286,13 @@ class Studio(QMainWindow):
         self.analyze_button = self.button("Fast Montage", self.generate)
         self.analyze_button.setObjectName("primary")
         self.import_target = TargetDuration()
-        self.import_target.setRange(1020, 1080)
+        self.import_target.setRange(FIXED_GENERATION_MIN_SECONDS, FIXED_MAX_SECONDS)
         self.import_target.setValue(1050)
         self.import_target.setSingleStep(5)
-        form.addRow("Target duration", self.import_target)
+        form.addRow("Fixed duration target", self.import_target)
+        self.import_duration_details = QLabel()
+        self.import_duration_details.setWordWrap(True)
+        form.addRow(self.import_duration_details)
         form.addRow(self.analyze_button)
         form.addRow(self.button("Analyze Movie / Generate AI Review…", self.open_director))
         form.addRow(self.button("AI Settings…", self.open_ai_settings))
@@ -330,7 +333,7 @@ class Studio(QMainWindow):
         header.addWidget(self.editor_title, 1)
         header.addWidget(QLabel("Target"))
         self.target = TargetDuration()
-        self.target.setRange(1020, 1080)
+        self.target.setRange(FIXED_GENERATION_MIN_SECONDS, FIXED_MAX_SECONDS)
         self.target.setValue(1050)
         self.target.setSingleStep(5)
         self.target.setFixedWidth(93)
@@ -636,8 +639,10 @@ class Studio(QMainWindow):
             cues = transcript["segments"]
             if cues:
                 audio = replace(audio, captions=tuple((float(c["start"]), float(c["end"])) for c in cues))
+            omissions = []
             highlights = adaptive.cinema(self.movie, analysis, audio, self.cache, progress, self.cinema_settings,
-                                         self.highlights, self.script, min_gap) if include_highlights else []
+                                         self.highlights, self.script, min_gap, omissions=omissions
+                                         ) if include_highlights and action != "analyze" else []
             goal = (adaptive.narration_frames(self.voice_recording, self.movie.fps) + sum(c.frames for c in highlights)) / self.movie.fps if adapt else target
             local_planner = provider and provider.url == local_ai.OLLAMA + "/v1/chat/completions"
             if local_planner:
@@ -688,7 +693,7 @@ class Studio(QMainWindow):
                     local_ai.release_model(provider.model)
                 except RuntimeError:
                     logging.warning("The completed review was retained after a text model unload error.", exc_info=True)
-            return analysis, audio, highlights, clips, script, failed_observations, dialogue_status
+            return analysis, audio, highlights, clips, script, failed_observations, dialogue_status, omissions
 
         def apply(result):
             if action == "analyze":
@@ -696,9 +701,12 @@ class Studio(QMainWindow):
                 self.refresh()
                 self.statusBar().showMessage(f"Analysis cached · {count} scenes · {failed} skipped/failed · dialogue: {transcript_source}")
                 return
+            if not self.approve_audio_omissions(result[-1]):
+                return
             self.record_edit()
+            self.cinema_settings = dict(self.cinema_settings, omit_auto_audio=not include_highlights)
             self.drop_generated_voice()
-            self.analysis, self.waves["original"], self.highlights, self.clips, self.script, failed, dialogue_status = result
+            self.analysis, self.waves["original"], self.highlights, self.clips, self.script, failed, dialogue_status = result[:-1]
             self.director_mode, self.director_language = content_mode, lang
             self.script_approved = False
             self.source_playback = False
@@ -863,7 +871,7 @@ class Studio(QMainWindow):
     def export_director_timeline(self):
         self.require_movie(True)
         self.check(self.clips)
-        if any(c.gap for c in self.clips):
+        if has_picture_gap(self.clips):
             raise ValueError("Fill unresolved picture gaps before exporting a timeline.")
         path, _ = QFileDialog.getSaveFileName(self, "Export timeline", "timeline.json", "JSON (*.json)")
         if not path:
@@ -1251,18 +1259,32 @@ class Studio(QMainWindow):
         return bool(self.voice_sync and self.voice and self.voice_sync["stamp"] == self.voice_edit_stamp())
 
     def fitted_narration(self):
-        return self.voice_sync_valid() and self.voice_sync["fit"]
+        return self.adaptive_duration() or bool(self.voice_sync_valid() and self.voice_sync.get("fit"))
+
+    def adaptive_samples(self):
+        return self.voice_recording.frames if self.adaptive_duration() and self.voice_recording else None
 
     def check_managed_narration(self, final=False):
-        if any(clip.gap for clip in self.clips):
+        if has_picture_gap(self.clips):
             raise ValueError("Fill unresolved picture gaps before playback or export.")
-        if final and self.adaptive_duration() and any(self.voice_parts) and not (
-                self.voice_sync_valid() and self.voice_sync.get("adaptive")):
+        if final and self.adaptive_duration() and not (
+                self.voice_recording and self.voice_sync_valid() and self.voice_sync.get("adaptive")):
             raise ValueError("Run Merge & Synchronize to calculate the adaptive export duration.")
         if self.voice_sync and not self.voice_sync_valid():
             raise ValueError("The edit changed. Run Voice-over Manager → Merge & Synchronize before playback or export.")
         if final and any(self.voice_parts) and not self.voice:
             raise ValueError("Run Voice-over Manager → Merge & Synchronize before export.")
+
+    def approve_audio_omissions(self, omissions):
+        if not omissions:
+            return True
+        message = "\n".join(dict.fromkeys(omissions))
+        return QMessageBox.question(
+            self, "Original audio needs a decision",
+            message + "\n\nApply the proposed edit with these sections omitted?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        ) == QMessageBox.StandardButton.Yes
 
     def process_voice(self, action, play=None, *, destination=None, record=True):
         parts = tuple(part for part in self.voice_parts if part)
@@ -1290,10 +1312,33 @@ class Studio(QMainWindow):
                         ffmpeg("-i", str(recording.path), "-c:a", "libmp3lame", "-q:a", "2", str(output))
                     output.replace(destination)
                 return recording, destination
+            omissions = []
             try:
                 notices = []
+                restored = []
+                source_clips = clips
+                if adapt and movie.has_audio and not has_picture_gap(clips) and not self.cinema_settings.get("omit_auto_audio"):
+                    active = [c for c in clips if c.highlight and c.movie_audio]
+                    configured = self.cinema_settings
+                    missing = (any(configured[role.lower()] and not configured.get(f"disable_{role}")
+                                   and not any(c.role == role for c in active) for role in ("Opening", "Ending"))
+                               or sum(c.role not in {"Opening", "Ending"} for c in active) < configured["count"]
+                               or any(not c.picture and c.frames > 5 * movie.fps for c in active))
+                    if missing:
+                        audio = self.waves["original"]
+                        if not audio.peaks:
+                            audio = self.read_movie_evidence(progress)
+                        proposed = adaptive.cinema(movie, analysis, audio, self.cache, progress, configured,
+                                                   active, script, gap, reserved=[c for c in clips if not c.movie_audio],
+                                                   omissions=omissions,
+                                                   bookend_neighbors=[c for c in clips if not c.movie_audio])
+                        replacement = {(c.start, c.end, c.role): c for c in proposed}
+                        source_clips = [c if c not in active
+                                        else replacement[(c.start, c.end, c.role)] for c in clips
+                                        if c not in active or (c.start, c.end, c.role) in replacement]
+                        restored = [c for c in proposed if c.movie_audio and c not in source_clips]
                 cues = []
-                if script or adapt and any(c.movie_audio and c.role not in {"Opening", "Ending"} for c in clips):
+                if script or adapt and any(c.movie_audio and c.role not in {"Opening", "Ending"} for c in (*source_clips, *restored)):
                     try:
                         cues = narration.transcript(recording, parts, captions, self.cache, progress)
                     except (OSError, RuntimeError, ValueError):
@@ -1302,7 +1347,8 @@ class Studio(QMainWindow):
                         notices.append("Narration timing cues were unavailable. Verified waveform pauses were used.")
                 if adapt:
                     picture, sections, schedule, length, aligned = adaptive.fit_recording(
-                        recording, clips, movie, analysis, self.cache, gap, progress, script=script, cues=cues, notices=notices)
+                        recording, source_clips, movie, analysis, self.cache, gap, progress, script=script, cues=cues,
+                        notices=notices, omissions=omissions, restored=restored)
                 else:
                     picture, sections, schedule, length, aligned = narration.synchronize(
                         recording, clips, script, cues, movie, analysis, gap, fit, progress)
@@ -1314,7 +1360,7 @@ class Studio(QMainWindow):
                 "stamp": self.voice_edit_stamp(picture, sections), "schedule": schedule,
                 "length": length, "aligned": aligned, "fit": fit or adapt, "adaptive": adapt, "notices": notices,
                 "identities": [part.stamp for part in parts],
-            })
+            }), omissions
 
         def apply(result):
             recording = result[0]
@@ -1325,13 +1371,17 @@ class Studio(QMainWindow):
                         self.voice_manager.update_summary()
                     self.error(result[1])
                     return
+                if not self.approve_audio_omissions(result[2]):
+                    self.statusBar().showMessage("Kept the current edit and its original audio.")
+                    return
                 if record:
                     self.record_edit()
                 self.voice_recording = recording
                 self.clips, self.script, self.voice, self.waves["voice"], self.voice_sync = result[1]
                 self.generated_voice = None
                 if self.voice_sync["adaptive"]:
-                    self.highlights = [clip for clip in self.highlights if clip not in clips or clip in self.clips]
+                    active = [c for c in self.clips if c.highlight]
+                    self.highlights = [c for c in self.highlights if c not in clips and c not in active] + active
                 self.invalidate_preview()
                 self.refresh()
                 notices = self.voice_sync.get("notices", [])
@@ -1520,8 +1570,9 @@ class Studio(QMainWindow):
         def build(progress):
             analysis = self.analysis or analyze(self.movie, self.cache, progress)
             evidence = self.read_movie_evidence(progress)
+            omissions = []
             highlights = adaptive.cinema(self.movie, analysis, evidence, self.cache, progress, self.cinema_settings,
-                                         self.highlights, min_gap=min_gap)
+                                         self.highlights, min_gap=min_gap, omissions=omissions)
             goal = target
             if adapt:
                 frames = adaptive.narration_frames(self.voice_recording, self.movie.fps)
@@ -1538,20 +1589,22 @@ class Studio(QMainWindow):
                 elif self.highlights or not highlights or adapt:
                     raise
                 else:
-                    progress("No usable cut for suggested original audio at this duration.")
+                    omissions.append("The requested montage cannot fit the proposed original-audio groups.")
                     highlights = []
                     clips = assemble(analysis.candidates, locked, self.movie.fps, analysis.frames,
                                      goal, evidence, progress, min_gap=min_gap)
             clips = adaptive.bookends(clips)
             validate(clips, self.movie.fps, analysis.frames, has_audio=self.movie.has_audio, min_gap=min_gap)
-            return analysis, evidence, highlights, clips
+            return analysis, evidence, highlights, clips, omissions
 
         def apply(result):
+            if not self.approve_audio_omissions(result[-1]):
+                return
             self.record_edit()
             self.script = []
             self.script_approved = False
             self.drop_generated_voice()
-            self.analysis, self.waves["original"], self.highlights, self.clips = result
+            self.analysis, self.waves["original"], self.highlights, self.clips = result[:-1]
             self.source_playback = False
             self.invalidate_preview()
             self.refresh()
@@ -1674,8 +1727,8 @@ class Studio(QMainWindow):
         fps = self.movie.fps
         gap = self.source_gap.value()
         try:
-            validate(clips, fps, self.analysis.frames, final=final and not self.fitted_narration(),
-                     has_audio=self.movie.has_audio, min_gap=gap)
+            validate(clips, fps, self.analysis.frames, final=final and (self.adaptive_samples() is not None or not self.fitted_narration()),
+                     has_audio=self.movie.has_audio, min_gap=gap, narration_samples=self.adaptive_samples())
         except ValueError:
             if final or preview:
                 raise
@@ -1698,7 +1751,7 @@ class Studio(QMainWindow):
         self.require_movie(True)
         row = self.selected_row()
         entry = self.entries[row]
-        if any(c.gap for c in self.clips) and not entry.segment.gap:
+        if has_picture_gap(self.clips) and not entry.segment.gap:
             self.preview([replace(entry.segment, role="", highlight=False, original=entry.segment.movie_audio)])
             return
         self.check_managed_narration()
@@ -1767,7 +1820,7 @@ class Studio(QMainWindow):
         clip = self.clips[index]
         if clip.locked:
             raise ValueError("Unlock this clip before replacing it.")
-        if clip.gap:
+        if self.entries[self.selected_row()].segment.gap:
             self.fill_gap()
             return
         if clip.highlight:
@@ -1821,6 +1874,17 @@ class Studio(QMainWindow):
         clip = self.clips[entry.edit_index]
         if clip.locked:
             raise ValueError("Unlock this clip before deleting it.")
+        if clip.picture and not entry.segment.gap:
+            local = self.selected_row() - next(i for i, row in enumerate(self.entries)
+                                               if row.edit_index == entry.edit_index)
+            picture = list(clip.picture)
+            picture[local] = adaptive.placeholder(picture[local])
+            self.apply_highlight(self.highlights.index(clip), replace(clip, picture=tuple(picture)))
+            self.select_edit(entry.edit_index)
+            self.statusBar().showMessage("Picture gap created. The original audio is still in place.")
+            return
+        if entry.segment.gap:
+            raise ValueError("Fill the selected picture gap or explicitly remove the audio group in Manual highlights.")
         if clip.gap:
             raise ValueError("Fill this picture gap to preserve narration timing.")
         if not clip.movie_audio and not clip.highlight and (self.voice or any(self.voice_parts)):
@@ -1841,9 +1905,24 @@ class Studio(QMainWindow):
         self.clips[index] = changed
         self.refresh()
 
+    def fill_original_picture(self, manual=None):
+        row = self.selected_row()
+        index = self.entries[row].edit_index
+        group = self.clips[index]
+        if group.locked:
+            raise ValueError("Unlock the original-audio group before replacing picture.")
+        fragment = row - next(i for i, entry in enumerate(self.entries) if entry.edit_index == index)
+        self.background("Finding independent picture for original audio…",
+                        lambda _: adaptive.replace_audio_picture(self.movie, self.analysis, self.cache, self.clips,
+                                                                  index, fragment, self.source_gap.value(), manual),
+                        lambda edited: self.apply_highlight(self.highlights.index(group), edited))
+
     def fill_gap(self, manual=None, *, gap=None):
         index = self.entries[self.selected_row()].edit_index
         original = self.clips[index]
+        if original.picture:
+            self.fill_original_picture(manual)
+            return
         if original.locked or (gap is None and not original.gap):
             raise ValueError("Select an unlocked picture gap.")
         edits = self.clips[:]
@@ -1975,8 +2054,11 @@ class Studio(QMainWindow):
         if self.clips[index].gap:
             self.fill_gap(candidate)
             return
+        if self.clips[index].picture:
+            self.fill_original_picture(candidate)
+            return
         if self.clips[index].highlight:
-            raise ValueError("Replace original-audio highlights with a continuous source range in Cut.")
+            raise ValueError("Replace legacy original-audio groups from Manual highlights.")
         if self.voice or any(self.voice_parts):
             self.fill_gap(candidate, gap=adaptive.placeholder(self.clips[index]))
             return
@@ -2188,8 +2270,13 @@ class Studio(QMainWindow):
         self.import_target.setEnabled(not adapt)
         recording, opening, middle, ending, total = adaptive.duration_totals(
             self.voice_recording, self.clips, movie.fps if movie else 1)
-        self.duration_details.setText(f"Narration {clock(recording)} · Opening {clock(opening)} · "
-                                      f"Highlights {clock(middle)} · Ending {clock(ending)} · Calculated {clock(total)}")
+        mode = "Adaptive to Narration" if adapt else "Fixed Duration"
+        count = sum(c.highlight and c.movie_audio and c.role not in {"Opening", "Ending"} for c in self.clips)
+        duration_text = (f"{mode} · Narration {clock(recording)} · Opening {clock(opening)} · "
+                         f"Highlights {count} / {clock(middle)} · Ending {clock(ending)} · "
+                         f"{'Calculated final ' + clock(total) if adapt else 'Target ' + clock(self.target.value())}")
+        self.duration_details.setText(duration_text)
+        self.import_duration_details.setText(duration_text)
         part_count = sum(part is not None for part in self.voice_parts)
         state = "synced" if self.voice_sync_valid() else "ready to merge"
         self.voice_label.setText(f"{part_count} audio parts · {state}" if part_count else
@@ -2219,14 +2306,14 @@ class Studio(QMainWindow):
         self.track_labels.update()
         self.total_label.setText(f"{clock(cursor / movie.fps if movie else 0)} total")
         self.final_summary.setText(f"{len(entries)} video segments · {clock(cursor / movie.fps if movie else 0)}\n"
-                                   f"{sum(clip.highlight and clip.movie_audio for clip in self.clips)} original-audio highlights in timeline\n"
+                                   f"{duration_text}\n"
                                    "H.264 video · AAC stereo · MP4")
         conflicts = 0
         if movie and self.clips:
             conflicts = len(fragment_issues(self.clips, movie.fps, self.analysis.frames, self.source_gap.value()))
             if conflicts:
                 self.final_summary.setText(self.final_summary.text() + f"\n{conflicts} source separation cuts to repair before export.")
-        gaps = sum(c.gap for c in self.clips)
+        gaps = sum(entry.segment.gap for entry in entries)
         if gaps:
             self.final_summary.setText(self.final_summary.text() + f"\n{gaps} unresolved picture gaps.")
         self.export_button.setEnabled(bool(self.clips) and not gaps and not conflicts)
@@ -2253,7 +2340,7 @@ class Studio(QMainWindow):
                               "sync": self.voice_sync},
             "title": self.title.text(), "year": self.year.value(), "target": self.target.value(),
             "highlights": [[c.start, c.end, list(c.cuts), c.muted, c.role, c.locked,
-                            [[part.start, part.end] for part in c.picture]] for c in self.highlights],
+                            [[part.start, part.end, True] if part.gap else [part.start, part.end] for part in c.picture]] for c in self.highlights],
             "clips": [[c.start, c.end, c.highlight, c.original, c.role] + ([c.locked, c.gap] if c.locked or c.gap else []) for c in self.clips],
         })
         self.statusBar().showMessage(f"Saved edit to {destination}")
@@ -2405,7 +2492,7 @@ class Studio(QMainWindow):
     def validation_report(self):
         return timeline_validation_report(self.clips, self.movie.fps, self.analysis.frames,
                                           has_audio=self.movie.has_audio, min_gap=self.source_gap.value(),
-                                          fitted_duration=self.fitted_narration())
+                                          fitted_duration=self.fitted_narration(), narration_samples=self.adaptive_samples())
 
     def save_timeline_report(self):
         self.require_movie(True)
@@ -2444,7 +2531,7 @@ class Studio(QMainWindow):
             output = render(self.movie, self.analysis, self.clips, self.voice, self.music, self.cache, progress,
                             destination=destination, mix=self.mix, min_gap=min_gap,
                             managed_voice=self.voice_sync_valid(), fitted_duration=self.fitted_narration(),
-                            fade_ending=self.cinema_settings.get("fade", False))
+                            fade_ending=self.cinema_settings.get("fade", False), narration_samples=self.adaptive_samples())
             atomic_json(report_path, report)
             return output
 

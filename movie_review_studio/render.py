@@ -11,8 +11,9 @@ import wave
 from .analysis import Analysis
 from .media import Media, ffmpeg, identity, invoke, seconds, video_seek
 from .model import DEFAULT_SOURCE_GAP, Clip, MAX_CLIP_SECONDS, timeline_entries, validate
+from .model import NARRATION_SAMPLE_RATE, has_picture_gap
 
-RATE = 48000
+RATE = NARRATION_SAMPLE_RATE
 VERSION = "render-6"
 
 
@@ -185,12 +186,12 @@ def render_selection(movie: Media, analysis: Analysis, clips: list[Clip], row: i
 
 def render(movie: Media, analysis: Analysis, clips: list[Clip], voice: Path | None,
            music: Path | None, cache: Path, progress, *, destination: Path | None = None, mix: Mix | None = None,
-           min_gap=DEFAULT_SOURCE_GAP, managed_voice=False, fitted_duration=False, fade_ending=False) -> Path:
+           min_gap=DEFAULT_SOURCE_GAP, managed_voice=False, fitted_duration=False, fade_ending=False, narration_samples=None) -> Path:
     preview = destination is None
-    if any(c.gap for c in clips):
+    if has_picture_gap(clips):
         raise ValueError("Fill unresolved picture gaps before rendering.")
-    validate(clips, movie.fps, analysis.frames, final=not preview and not fitted_duration, has_audio=movie.has_audio,
-             min_gap=min_gap)
+    validate(clips, movie.fps, analysis.frames, final=not preview and (narration_samples is not None or not fitted_duration), has_audio=movie.has_audio,
+             min_gap=min_gap, narration_samples=narration_samples)
     entries = timeline_entries(clips, movie.fps)
     identities = [identity(path) if path else None for path in (movie.path, voice, music)]
     key_data = (VERSION, identities, [(c.start, c.end, c.highlight, c.cuts, c.original, c.muted, c.role, [(part.start, part.end) for part in c.picture]) for c in clips],
@@ -238,6 +239,17 @@ def render(movie: Media, analysis: Analysis, clips: list[Clip], voice: Path | No
                "-video_track_timescale", str(movie.fps.numerator), "-movflags", "+faststart", str(intermediate))
         if identities != [identity(path) if path else None for path in (movie.path, voice, music)]:
             raise ValueError("An imported file changed during rendering. Import the media again.")
+        if not preview:
+            streams = json.loads(invoke(["ffprobe", "-v", "error", "-show_entries",
+                "stream=codec_type,nb_frames,duration", "-of", "json", str(intermediate)]))["streams"]
+            expected_frames = sum(clip.frames for clip in clips)
+            video = next((stream for stream in streams if stream["codec_type"] == "video"), {})
+            sound = next((stream for stream in streams if stream["codec_type"] == "audio"), {})
+            expected_seconds = float(expected_frames / movie.fps)
+            if (int(video.get("nb_frames", 0)) != expected_frames or
+                    abs(float(video.get("duration", 0)) - expected_seconds) > .05 or
+                    abs(float(sound.get("duration", 0)) - expected_seconds) > .05):
+                raise ValueError("The encoded video or audio length differs from the validated timeline.")
         progress("Finishing output…")
         intermediate.replace(destination)
     return destination

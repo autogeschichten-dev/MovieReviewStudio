@@ -12,7 +12,7 @@ import numpy as np
 
 from .analysis import atomic_json, fingerprint_highlight
 from .media import ffmpeg, identity, invoke
-from .model import DEFAULT_SOURCE_GAP, adjacent_conflict, overlaps, similar, validate
+from .model import FIXED_GENERATION_MIN_SECONDS, FIXED_MAX_SECONDS, DEFAULT_SOURCE_GAP, adjacent_conflict, overlaps, similar, validate
 
 PEAKS_PER_SECOND = 20
 
@@ -160,8 +160,8 @@ def assemble(candidates, highlights, fps, source_frames, target_seconds, evidenc
              min_gap=DEFAULT_SOURCE_GAP, adaptive=False):
     """Distribute selected footage over the source and keep its source order."""
     goal = math.ceil(target_seconds * fps)
-    minimum = goal if adaptive else math.ceil(1020 * fps)
-    ceiling = goal + math.ceil(5 * fps) if adaptive else int(1080 * fps)
+    minimum = goal if adaptive else math.ceil(FIXED_GENERATION_MIN_SECONDS * fps)
+    ceiling = goal + math.ceil(5 * fps) if adaptive else int(FIXED_MAX_SECONDS * fps)
     target = max(minimum, min(ceiling, goal if adaptive else round(target_seconds * fps)))
     selected = sorted(highlights, key=lambda clip: clip.start)
     starts = [clip.start for clip in selected]

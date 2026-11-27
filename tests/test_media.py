@@ -220,6 +220,13 @@ class MediaTests(unittest.TestCase):
 
         studio.select_row(2)
         self.assertIn("Original movie audio", studio.inspector_details.text())
+        studio.delete_clip()
+        self.assertTrue(studio.clips[1].picture[1].gap)
+        self.assertTrue(studio.clips[1].movie_audio)
+        self.assertEqual(studio.clips[1].frames, highlight.frames)
+        self.assertFalse(studio.export_button.isEnabled())
+        studio.undo()
+        self.assertEqual(studio.clips[1], highlight)
         studio.select_row(4)
         studio.toggle_clip_audio()
         self.assertTrue(studio.clips[-1].movie_audio)

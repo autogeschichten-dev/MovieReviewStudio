@@ -200,6 +200,8 @@ jobs:
             title="Movie Review Studio V3.3.2 — Narration-First Synchronization"
           elif [[ "$RELEASE_TAG" == "stage3-windows-v3.4.1" ]]; then
             title="Movie Review Studio V3.4.1 — Strict Global Fragment Validation"
+          elif [[ "$RELEASE_TAG" == "stage3-windows-v3.4.2" ]]; then
+            title="Movie Review Studio V3.4.2 — Original Audio Restoration and Adaptive Export"
           fi
           gh release create "$RELEASE_TAG" "$ZIP_NAME" \
             --repo "$GITHUB_REPOSITORY" --verify-tag \

@@ -161,3 +161,9 @@ For shortages of up to five seconds, recovery first looks for an unused portion 
 In Adaptive to Narration, **Merge & Synchronize** sizes the picture to the processed recording first. It looks for verified quiet frames near each intermediate original-audio cut and also considers pauses between imported parts. Timestamped narration cues, when available, exclude frames inside speech. Opening and ending audio remain outside the narration. An unlocked intermediate highlight with no compatible pause is skipped with a message. Undo restores the earlier timeline. Locked cuts stay protected.
 
 If the picture is too short, synchronization can add unused cached alternatives approved by the existing script. Without a linked script it can extend the existing source order with eligible cached scenes. Every resulting cut is validated before the edit is applied.
+
+### Adaptive export and original-audio restoration
+
+Adaptive export uses the processed narration sample count, rounded up to a picture frame, plus enabled original-audio frames. A stale sync state prompts for synchronization. **Merge & Synchronize** looks for missing enabled audio groups using cached shot analysis. Before applying an edit that would omit an enabled section, the editor lists the missing groups and asks whether to proceed.
+
+Deleting an individual picture fragment from an independent original-audio group creates a gap and preserves the audio. Use **Auto fill gap** or choose a replacement in the source browser. Remove the entire audio interval explicitly in **Manual highlights**. Picture gaps block export until repaired.
