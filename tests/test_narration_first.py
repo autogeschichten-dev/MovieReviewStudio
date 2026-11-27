@@ -115,7 +115,7 @@ class NarrationFirstMediaTests(unittest.TestCase):
         total = adaptive.narration_frames(merged, fps)
         left = [clip(1000 + 245 * i, 119) for i in range(80)]
         before = sum(item.frames for item in left)
-        to_pause = round(Fraction(460125, 1000) * fps) - before
+        to_pause = round(Fraction(460375, 1000) * fps) - before
         full, tail = divmod(to_pause, 119)
         lengths = [119] * full + ([tail] if tail else [])
         full, tail = divmod(total + 19 - before - to_pause, 119)
