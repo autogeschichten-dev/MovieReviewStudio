@@ -167,3 +167,7 @@ If the picture is too short, synchronization can add unused cached alternatives 
 Adaptive export uses the processed narration sample count, rounded up to a picture frame, plus enabled original-audio frames. A stale sync state prompts for synchronization. **Merge & Synchronize** looks for missing enabled audio groups using cached shot analysis. Before applying an edit that would omit an enabled section, the editor lists the missing groups and asks whether to proceed.
 
 Deleting an individual picture fragment from an independent original-audio group creates a gap and preserves the audio. Use **Auto fill gap** or choose a replacement in the source browser. Remove the entire audio interval explicitly in **Manual highlights**. Picture gaps block export until repaired.
+
+### Default original-audio structure
+
+New projects request a 10-second opening, three 12-second intermediate highlights, and a 10-second ending. Saved project settings remain in effect. Fast Montage checks the bookend joins in their final positions, and synchronization searches multiple combinations of verified pauses before proposing an omission. Export requires a matching approval when enabled groups are missing. Use **Merge & Synchronize** to retry missing enabled audio in an existing adaptive project.

@@ -100,6 +100,20 @@ def replace_audio_picture(movie, analysis, cache, edits, index, fragment, min_ga
     raise ValueError("No replacement can preserve this original-audio passage with the required picture separation.")
 
 
+def audio_structure(settings, clips):
+    if settings.get("omit_auto_audio"):
+        return {}
+    expected = {"Opening": int(bool(settings["opening"]) and not settings.get("disable_Opening")),
+                "Highlight": settings["count"],
+                "Ending": int(bool(settings["ending"]) and not settings.get("disable_Ending"))}
+    present = dict.fromkeys(expected, 0)
+    for group in clips:
+        if group.highlight and group.movie_audio:
+            role = group.role if group.role in {"Opening", "Ending"} else "Highlight"
+            present[role] += 1
+    return {role: [expected[role], present[role]] for role in expected if present[role] < expected[role]}
+
+
 def cinema(movie, analysis, evidence, cache, progress, settings, existing=(), script=(), min_gap=5, *,
            reserved=(), omissions=None, bookend_neighbors=()):
     if omissions is None:
@@ -169,7 +183,15 @@ def cinema(movie, analysis, evidence, cache, progress, settings, existing=(), sc
         if candidates:
             _, start = max(candidates)
             progress(f"Preparing original audio · {role}")
-            for _, start in sorted(candidates, reverse=True)[:24]:
+            # Spread alternate attempts across source neighborhoods. A single dense scene can
+            # otherwise occupy the whole shortlist even when its cutaway pool cannot work.
+            attempts = sorted(candidates, reverse=True)
+            bins = {}
+            for _, start in attempts:
+                bins.setdefault(start // max(1, round(30 * movie.fps)), []).append(start)
+            limit = min(96, len(attempts))
+            diverse = [row[i] for i in range(4) for row in bins.values() if i < len(row)]
+            for start in diverse[:limit]:
                 try:
                     group = fingerprint_highlight(movie, analysis, start, start + length, cache=cache, role=role,
                                                   reserved=(*marked, *reserved), min_gap=min_gap, screened=screened)
@@ -180,11 +202,10 @@ def cinema(movie, analysis, evidence, cache, progress, settings, existing=(), sc
                     break
             else:
                 progress(f"Skipped {role.lower()}: no suitable non-adjacent picture.")
-    for role, count in expected.items():
-        found = sum(c.movie_audio and (c.role == role or role == "Highlight" and c.role not in {"Opening", "Ending"})
-                    for c in marked)
-        if found < count:
-            omissions.append(f"{role}: found {found} of {count} requested original-audio sections with valid picture.")
+    for role, (count, found) in audio_structure(settings, marked).items():
+        detail = "no non-silent candidate passage" if not evidence.peaks or max(evidence.peaks) < .025 else (
+            "no remaining passage with enough screened cutaways and compatible picture joins")
+        omissions.append(f"{role}: found {found} of {count} requested original-audio sections with valid picture; {detail}.")
     return marked
 
 
@@ -301,7 +322,6 @@ def retime_cut(body, offsets, frame, movie, analysis, cache):
 
 
 def insert_groups(body, opening, ending, groups, recording, quiet, movie, analysis, cache, min_gap, progress, notices, omissions):
-    inserted = {}
     fps = movie.fps
     total = sum(c.frames for c in body)
 
@@ -315,22 +335,40 @@ def insert_groups(body, opening, ending, groups, recording, quiet, movie, analys
             frame += clip.frames
         return [*out, *ending]
 
-    for group, preferred in groups:
-        offsets = list(accumulate(c.frames for c in body))
-        candidates = break_candidates(offsets, total, inserted, quiet, preferred, fps)
+    best = None
+    attempts = 0
+
+    def search(number, picture, offsets, moved, skipped):
+        nonlocal best, attempts
+        if best and len(skipped) >= len(best[2]):
+            return False
+        if number == len(groups):
+            result = candidate_picture(picture, offsets)
+            try:
+                validate(result, fps, analysis.frames, has_audio=movie.has_audio, min_gap=min_gap)
+            except ValueError:
+                return False
+            best = result, moved, skipped
+            return not skipped
+        group, preferred = groups[number]
+        cuts = list(accumulate(c.frames for c in picture))
+        candidates = break_candidates(cuts, total, offsets, quiet, preferred, fps)
         if group.locked:
             candidates = [preferred] if preferred in candidates else []
         for frame in candidates:
-            index = bisect_left(offsets, frame)
+            if attempts >= 320:
+                break
+            attempts += 1
+            at = bisect_left(cuts, frame)
             try:
-                trial = body if offsets[index] == frame else retime_cut(body, offsets, frame, movie, analysis, cache)
+                trial = picture if cuts[at] == frame else retime_cut(picture, cuts, frame, movie, analysis, cache)
             except (OSError, RuntimeError, ValueError):
                 continue
             if trial is None:
                 continue
-            positions_by_frame = {**inserted, frame: group}
-            proposed = candidate_picture(trial, positions_by_frame)
-            if any(audio not in proposed for audio in positions_by_frame.values()):
+            anchors = {**offsets, frame: group}
+            proposed = candidate_picture(trial, anchors)
+            if any(audio not in proposed for audio in anchors.values()):
                 continue
             _, capacity, boundaries = positions(proposed, fps)
             if capacity < recording.frames or any(
@@ -340,21 +378,29 @@ def insert_groups(body, opening, ending, groups, recording, quiet, movie, analys
                 validate(proposed, fps, analysis.frames, has_audio=movie.has_audio, min_gap=min_gap)
             except ValueError:
                 continue
-            body, inserted = trial, positions_by_frame
-            if frame != preferred:
-                note = f"Moved original-audio cut to {float(frame / fps):.1f} s of narration."
-                notices.append(note)
-                progress(note)
-            break
-        else:
-            if group.locked:
-                raise ValueError("A locked original-audio cut has no verified pause at its current position. Unlock it to allow recovery.")
-            note = f"Skipped original audio at source {float(group.start / fps):.1f} s: no compatible verified pause. Undo restores this cut."
-            notices.append(note)
-            if omissions is not None:
-                omissions.append(note)
-            progress(note)
-    return candidate_picture(body, inserted)
+            next_moved = moved if frame == preferred else [*moved, frame]
+            if search(number + 1, trial, anchors, next_moved, skipped):
+                return True
+        if group.locked:
+            return False
+        return search(number + 1, picture, offsets, moved, [*skipped, group])
+
+    search(0, body, {}, [], [])
+    if best is None:
+        validate(candidate_picture(body, {}), fps, analysis.frames, has_audio=movie.has_audio, min_gap=min_gap)
+        raise ValueError("A protected original-audio cut could not be aligned to a verified pause.")
+    result, moved, skipped = best
+    for frame in moved:
+        note = f"Moved original-audio cut to {float(frame / fps):.1f} s of narration."
+        notices.append(note)
+        progress(note)
+    for group in skipped:
+        note = f"Skipped original audio at source {float(group.start / fps):.1f} s: no compatible verified pause and strict picture join."
+        notices.append(note)
+        if omissions is not None:
+            omissions.append(note)
+        progress(note)
+    return result
 
 
 def grow_picture(body, originals, needed, movie, analysis, min_gap, script):

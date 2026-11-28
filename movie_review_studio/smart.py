@@ -163,9 +163,11 @@ def assemble(candidates, highlights, fps, source_frames, target_seconds, evidenc
     minimum = goal if adaptive else math.ceil(FIXED_GENERATION_MIN_SECONDS * fps)
     ceiling = goal + math.ceil(5 * fps) if adaptive else int(FIXED_MAX_SECONDS * fps)
     target = max(minimum, min(ceiling, goal if adaptive else round(target_seconds * fps)))
-    selected = sorted(highlights, key=lambda clip: clip.start)
+    opening = [c for c in highlights if c.role == "Opening"]
+    ending = [c for c in highlights if c.role == "Ending"]
+    selected = sorted((c for c in highlights if c.role not in {"Opening", "Ending"}), key=lambda clip: clip.start)
     starts = [clip.start for clip in selected]
-    frames = sum(clip.frames for clip in selected)
+    frames = sum(clip.frames for clip in highlights)
     lanes = [[] for _ in range(16)]
     seen = {}
 
@@ -191,8 +193,8 @@ def assemble(candidates, highlights, fps, source_frames, target_seconds, evidenc
                 if prefer_distinct and sample and any(similar(sample, used) for used in seen.get(sample.phash, ())):
                     continue
                 slot = bisect_left(starts, clip.start)
-                left = selected[slot - 1] if slot else None
-                right = selected[slot] if slot < len(selected) else None
+                left = selected[slot - 1] if slot else opening[-1] if opening else None
+                right = selected[slot] if slot < len(selected) else ending[0] if ending else None
                 if ((left and (overlaps(left, clip) or adjacent_conflict(left, clip, fps, min_gap))) or
                     (right and (overlaps(right, clip) or adjacent_conflict(clip, right, fps, min_gap)))):
                     continue
@@ -220,10 +222,9 @@ def assemble(candidates, highlights, fps, source_frames, target_seconds, evidenc
             capacity = sum(c.frames for c, _ in route)
             if capacity < minimum:
                 raise ValueError(f"Available chronological picture: {float(capacity / fps):.3f} s under source gap, overlap, and visual cut rules.")
-            selected = [c for c, _ in route]
+            selected = [c for c, _ in route if c.role not in {"Opening", "Ending"}]
         else:
             raise ValueError('There is insufficient distinct usable footage for the chosen 17–18 minute target and source separation.')
-    if not adaptive:
-        from .adaptive import bookends
-        validate(bookends(selected), fps, source_frames, final=True, min_gap=min_gap)
-    return selected
+    result = [*opening, *selected, *ending]
+    validate(result, fps, source_frames, final=not adaptive, min_gap=min_gap)
+    return result

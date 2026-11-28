@@ -66,6 +66,23 @@ class AudioRestorationTests(TestCase):
         self.assertEqual([c.role for c in result], ["Opening", "Highlight"])
         self.assertIn("Ending: found 0 of 1", omissions[0])
 
+    def test_pause_search_backtracks_to_keep_all_three_groups(self):
+        fps = Fraction(1)
+        movie = SimpleNamespace(fps=fps, has_audio=True)
+        analysis = SimpleNamespace(frames=300)
+        body = [part(start, start + 5) for start in (0, 30, 60, 90)]
+        groups = [group(start, start + 12, "Highlight",
+                        [(start, start + 5), (start + 10, start + 15), (start + 20, start + 22)])
+                  for start in (120, 170, 220)]
+        recording = narration.Recording(Path("fixture"), 20 * RATE, ())
+        quiet = [(i * RATE, i * RATE) for i in (5, 10, 15)]
+        omissions = []
+        result = adaptive.insert_groups(body, [], [], list(zip(groups, (14, 15, 16))), recording,
+                                        quiet, movie, analysis, None, 5, lambda _: None, [], omissions)
+        self.assertEqual([clip for clip in result if clip.movie_audio], groups)
+        self.assertFalse(omissions)
+        self.assertEqual(adaptive.positions(result, fps)[2], [5 * RATE, 10 * RATE, 15 * RATE])
+
     def test_reported_adaptive_export_passes_duration_before_stale_sync_guard(self):
         import os
         from PySide6.QtWidgets import QApplication

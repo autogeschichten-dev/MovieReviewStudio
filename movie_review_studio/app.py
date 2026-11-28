@@ -114,7 +114,7 @@ class Studio(QMainWindow):
         self.movie = self.analysis = self.source_key = None
         self.voice = self.music = None
         self.duration_mode = "auto"
-        self.cinema_settings = {"opening": 10, "count": 2, "length": 12, "ending": 10}
+        self.cinema_settings = {"opening": 10, "count": 3, "length": 12, "ending": 10}
         self.voice_parts = (None,) * 3
         self.voice_pause, self.voice_trim, self.voice_fit = 250, True, False
         self.voice_captions = self.voice_recording = self.voice_sync = self.voice_manager = None
@@ -704,7 +704,9 @@ class Studio(QMainWindow):
             if not self.approve_audio_omissions(result[-1]):
                 return
             self.record_edit()
-            self.cinema_settings = dict(self.cinema_settings, omit_auto_audio=not include_highlights)
+            self.cinema_settings = dict(self.cinema_settings, omit_auto_audio=not include_highlights,
+                                        accepted_omissions=adaptive.audio_structure(self.cinema_settings, result[3])
+                                        if result[-1] else {})
             self.drop_generated_voice()
             self.analysis, self.waves["original"], self.highlights, self.clips, self.script, failed, dialogue_status = result[:-1]
             self.director_mode, self.director_language = content_mode, lang
@@ -1379,6 +1381,8 @@ class Studio(QMainWindow):
                 self.voice_recording = recording
                 self.clips, self.script, self.voice, self.waves["voice"], self.voice_sync = result[1]
                 self.generated_voice = None
+                self.cinema_settings = dict(self.cinema_settings, accepted_omissions=(
+                    adaptive.audio_structure(self.cinema_settings, self.clips) if result[2] else {}))
                 if self.voice_sync["adaptive"]:
                     active = [c for c in self.clips if c.highlight]
                     self.highlights = [c for c in self.highlights if c not in clips and c not in active] + active
@@ -1605,6 +1609,9 @@ class Studio(QMainWindow):
             self.script_approved = False
             self.drop_generated_voice()
             self.analysis, self.waves["original"], self.highlights, self.clips = result[:-1]
+            self.cinema_settings = dict(self.cinema_settings, omit_auto_audio=False,
+                                        accepted_omissions=adaptive.audio_structure(
+                                            dict(self.cinema_settings, omit_auto_audio=False), self.clips) if result[-1] else {})
             self.source_playback = False
             self.invalidate_preview()
             self.refresh()
@@ -2436,7 +2443,7 @@ class Studio(QMainWindow):
             (payload, self.movie, self.analysis, self.highlights, self.clips, tracks, self.waves,
              manager, parts, self.voice_recording) = result
             self.duration_mode = payload.get("duration_mode", "auto")
-            self.cinema_settings = payload.get("cinema", {"opening": 10, "count": 2, "length": 12, "ending": 10})
+            self.cinema_settings = payload.get("cinema", {"opening": 10, "count": 3, "length": 12, "ending": 10})
             self.voice_parts = parts + (None,) * max(0, 3 - len(parts))
             self.voice_pause = manager.get("pause", 250)
             self.voice_trim = manager.get("trim", True)
@@ -2514,6 +2521,10 @@ class Studio(QMainWindow):
         self.require_movie(True)
         self.check(self.clips, final=True)
         self.check_managed_narration(final=True)
+        missing = adaptive.audio_structure(self.cinema_settings, self.clips)
+        if missing and missing != self.cinema_settings.get("accepted_omissions"):
+            details = ", ".join(f"{role} {present}/{wanted}" for role, (wanted, present) in missing.items())
+            raise ValueError(f"Enabled original audio is missing ({details}). Run Merge & Synchronize or update Original audio settings.")
         path, _ = QFileDialog.getSaveFileName(self, "Export review", "Movie Review.mp4", "MP4 video (*.mp4)")
         if not path:
             return
