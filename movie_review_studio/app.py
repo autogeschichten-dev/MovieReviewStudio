@@ -640,9 +640,11 @@ class Studio(QMainWindow):
             if cues:
                 audio = replace(audio, captions=tuple((float(c["start"]), float(c["end"])) for c in cues))
             omissions = []
-            highlights = adaptive.cinema(self.movie, analysis, audio, self.cache, progress, self.cinema_settings,
-                                         self.highlights, self.script, min_gap, omissions=omissions
-                                         ) if include_highlights and action != "analyze" else []
+            highlights = self.allocate_original_audio(analysis, audio, progress, omissions, existing=self.highlights,
+                              script=self.script, recording=self.voice_recording,
+                              settings=dict(self.cinema_settings, omit_auto_audio=False)
+                              ) if include_highlights and action != "analyze" else []
+            self.require_original_proposal(highlights, omissions)
             goal = (adaptive.narration_frames(self.voice_recording, self.movie.fps) + sum(c.frames for c in highlights)) / self.movie.fps if adapt else target
             local_planner = provider and provider.url == local_ai.OLLAMA + "/v1/chat/completions"
             if local_planner:
@@ -1027,6 +1029,7 @@ class Studio(QMainWindow):
         layout.addLayout(gap_form)
         self.source_gap.valueChanged.connect(lambda _: self.refresh() if hasattr(self, "timeline") else None)
         layout.addWidget(self.button("Save timeline validation report…", self.save_timeline_report))
+        layout.addWidget(self.button("Open audio allocation report…", self.open_audio_allocation))
         self.export_button = self.button("Validate and export MP4…", self.export)
         self.export_button.setObjectName("primary")
         layout.addWidget(self.export_button)
@@ -1277,6 +1280,42 @@ class Studio(QMainWindow):
         if final and any(self.voice_parts) and not self.voice:
             raise ValueError("Run Voice-over Manager → Merge & Synchronize before export.")
 
+    def audio_allocation_path(self):
+        return self.cache / f"audio-allocation-{self.source_key}.json"
+
+    def open_audio_allocation(self):
+        self.require_movie()
+        path = self.audio_allocation_path()
+        if not path.is_file():
+            raise ValueError("Generate or synchronize a review to create an audio allocation report.")
+        QDesktopServices.openUrl(QUrl.fromLocalFile(str(path)))
+
+    def allocate_original_audio(self, analysis, audio, progress, omissions, *, existing=(), script=(),
+                                reserved=(), recording=None, settings=None):
+        settings = self.cinema_settings if settings is None else settings
+        audit = []
+        pauses = []
+        if recording and recording.frames:
+            pauses = [(a + b) / (2 * recording.frames) for a, b in narration.quiet_ranges(recording)
+                      if 0 < a < b < recording.frames]
+        chosen = []
+        try:
+            chosen = adaptive.cinema(self.movie, analysis, audio, self.cache, progress, settings,
+                                     existing, script, self.source_gap.value(), reserved=reserved,
+                                     omissions=omissions, audit=audit, pause_fractions=pauses)
+            return chosen
+        finally:
+            atomic_json(self.audio_allocation_path(), {"source": str(self.movie.path),
+                "candidate_count": len(analysis.candidates), "dialogue_cues": len(audio.captions),
+                "safe_narration_pauses": len(pauses), "sections": audit, "omissions": omissions,
+                "selected": [{"role": c.role, "source_frames": [c.start, c.end],
+                              "picture_frames": [[part.start, part.end] for part in c.picture]} for c in chosen]})
+
+    def require_original_proposal(self, clips, omissions):
+        if omissions and not any(clip.movie_audio for clip in clips):
+            raise ValueError("No enabled original-audio section could be placed. The current edit was kept. "
+                             "Open the audio allocation report or select a source passage in Manual highlights.")
+
     def approve_audio_omissions(self, omissions):
         if not omissions:
             return True
@@ -1330,10 +1369,9 @@ class Studio(QMainWindow):
                         audio = self.waves["original"]
                         if not audio.peaks:
                             audio = self.read_movie_evidence(progress)
-                        proposed = adaptive.cinema(movie, analysis, audio, self.cache, progress, configured,
-                                                   active, script, gap, reserved=[c for c in clips if not c.movie_audio],
-                                                   omissions=omissions,
-                                                   bookend_neighbors=[c for c in clips if not c.movie_audio])
+                        proposed = self.allocate_original_audio(analysis, audio, progress, omissions,
+                            existing=active, script=script, recording=recording,
+                            reserved=[c for c in clips if not c.movie_audio and c.locked])
                         replacement = {(c.start, c.end, c.role): c for c in proposed}
                         source_clips = [c if c not in active
                                         else replacement[(c.start, c.end, c.role)] for c in clips
@@ -1354,6 +1392,7 @@ class Studio(QMainWindow):
                 else:
                     picture, sections, schedule, length, aligned = narration.synchronize(
                         recording, clips, script, cues, movie, analysis, gap, fit, progress)
+                self.require_original_proposal(picture, omissions)
                 bed = narration.materialize(recording, schedule, length, self.cache)
                 evidence = audio_evidence(bed, self.cache, progress)
             except (OSError, RuntimeError, ValueError) as error:
@@ -1575,8 +1614,10 @@ class Studio(QMainWindow):
             analysis = self.analysis or analyze(self.movie, self.cache, progress)
             evidence = self.read_movie_evidence(progress)
             omissions = []
-            highlights = adaptive.cinema(self.movie, analysis, evidence, self.cache, progress, self.cinema_settings,
-                                         self.highlights, min_gap=min_gap, omissions=omissions)
+            highlights = self.allocate_original_audio(analysis, evidence, progress, omissions,
+                         existing=self.highlights, reserved=locked, recording=self.voice_recording,
+                         settings=dict(self.cinema_settings, omit_auto_audio=False))
+            self.require_original_proposal(highlights, omissions)
             goal = target
             if adapt:
                 frames = adaptive.narration_frames(self.voice_recording, self.movie.fps)
@@ -1593,10 +1634,8 @@ class Studio(QMainWindow):
                 elif self.highlights or not highlights or adapt:
                     raise
                 else:
-                    omissions.append("The requested montage cannot fit the proposed original-audio groups.")
-                    highlights = []
-                    clips = assemble(analysis.candidates, locked, self.movie.fps, analysis.frames,
-                                     goal, evidence, progress, min_gap=min_gap)
+                    raise ValueError("The requested montage cannot fit the reserved original audio under strict cuts. "
+                                     "Choose another source passage in Manual highlights.")
             clips = adaptive.bookends(clips)
             validate(clips, self.movie.fps, analysis.frames, has_audio=self.movie.has_audio, min_gap=min_gap)
             return analysis, evidence, highlights, clips, omissions

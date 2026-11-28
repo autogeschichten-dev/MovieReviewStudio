@@ -171,3 +171,7 @@ Deleting an individual picture fragment from an independent original-audio group
 ### Default original-audio structure
 
 New projects request a 10-second opening, three 12-second intermediate highlights, and a 10-second ending. Saved project settings remain in effect. Fast Montage checks the bookend joins in their final positions, and synchronization searches multiple combinations of verified pauses before proposing an omission. Export requires a matching approval when enabled groups are missing. Use **Merge & Synchronize** to retry missing enabled audio in an existing adaptive project.
+
+### Original-audio allocation report
+
+Original-audio picture is reserved first. During adaptive recovery, locked narrated edits stay reserved and unlocked picture can be reallocated. The allocator searches alternative passages, durations, and increasingly wide cutaway pools, then backtracks across sections under a bounded search. The Export tab's **Open audio allocation report…** shows per-section attempted passages and filter counts. Counts are evaluations, so the same cutaway can appear more than once across alternate passages. An enabled soundtrack with no valid original-audio sections cannot replace the existing edit.

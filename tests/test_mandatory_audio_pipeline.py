@@ -82,16 +82,18 @@ class MandatoryAudioPipelineTests(TestCase):
         return True
 
     @staticmethod
-    def make_movie(root, output):
-        width, height, shots = 128, 72, 106
+    def make_movie(root, output, shots=106):
+        width, height = 128, 72
+        bits = max(7, (shots - 1).bit_length())
+        stride = width // bits if bits > 7 else 12
         raw = root / "picture.bgr"
         rng = np.random.default_rng(343)
         with raw.open("wb") as stream:
             for index in range(shots):
                 tiles = rng.integers(30, 224, (9, 16, 3), dtype=np.uint8)
                 image = np.repeat(np.repeat(tiles, 8, axis=0), 8, axis=1)
-                for bit in range(7):
-                    image[0:8, bit * 12:bit * 12 + 12] = 238 if (index >> bit) & 1 else 16
+                for bit in range(bits):
+                    image[0:8, bit * stride:(bit + 1) * stride] = 238 if (index >> bit) & 1 else 16
                 stream.write(image.tobytes() * 4)
         # The original sound is distinct from narration (1100 Hz) and music (170 Hz).
         signal = rf"aevalsrc=0.20*sin(2*PI*(330+37*mod(floor(t/4)\,7))*t):s={RATE}:d={shots * 4}"

@@ -1,4 +1,5 @@
 """Narration-driven planning and frame-accurate picture edits."""
+from collections import Counter
 from dataclasses import replace
 from bisect import bisect_left
 from fractions import Fraction
@@ -115,9 +116,11 @@ def audio_structure(settings, clips):
 
 
 def cinema(movie, analysis, evidence, cache, progress, settings, existing=(), script=(), min_gap=5, *,
-           reserved=(), omissions=None, bookend_neighbors=()):
+           reserved=(), omissions=None, bookend_neighbors=(), audit=None, pause_fractions=()):
     if omissions is None:
         omissions = []
+    if audit is None:
+        audit = []
     expected = {role: count for role, count in (
         ("Opening", int(bool(settings["opening"]))), ("Highlight", settings["count"]),
         ("Ending", int(bool(settings["ending"])))) if count and not settings.get(f"disable_{role}")}
@@ -158,54 +161,94 @@ def cinema(movie, analysis, evidence, cache, progress, settings, existing=(), sc
                 *[("Highlight", settings["length"], (i + 1) / (settings["count"] + 1), ())
                   for i in range(settings["count"])],
                 ("Ending", settings["ending"], 0.82, script[-1].evidence if script else ())]
+    rows = []
+    seen = Counter()
+    missing = {role: wanted - found for role, (wanted, found) in audio_structure(settings, marked).items()}
     for role, seconds, position, relevant in sections:
-        if not seconds or settings.get(f"disable_{role}", False):
+        seen[role] += 1
+        if seen[role] > missing.get(role, 0):
             continue
-        desired = sum(kind == role and second > 0 for kind, second, _, _ in sections)
-        if sum(c.role == role or role == "Highlight" and c.role not in {"Opening", "Ending"} for c in marked) >= desired:
-            continue
-        length = round(seconds * movie.fps)
-        target = position * analysis.frames
-        candidates = []
-        for start in starts:
-            end = start + length
-            if end > analysis.frames or any(start < c.end and c.start < end for c in marked if c.movie_audio):
-                continue
-            first, last = start / movie.fps, end / movie.fps
-            boundaries = sum(any(a < point < b for a, b in evidence.captions) for point in (first, last))
-            sound = evidence.score(float(first + analysis.offset), float(last + analysis.offset))
-            peaks = evidence.peaks[max(0, int((first + analysis.offset) * 20)):int((last + analysis.offset) * 20)]
-            if not peaks or max(peaks) < .025:
-                continue
-            support = any(start <= a < end for a, _, _ in relevant)
-            score = sound + .20 * by_start[start].score + float(support) - 2 * abs(start - target) / analysis.frames - boundaries
-            candidates.append((score, start))
-        if candidates:
-            _, start = max(candidates)
-            progress(f"Preparing original audio · {role}")
-            # Spread alternate attempts across source neighborhoods. A single dense scene can
-            # otherwise occupy the whole shortlist even when its cutaway pool cannot work.
-            attempts = sorted(candidates, reverse=True)
-            bins = {}
-            for _, start in attempts:
-                bins.setdefault(start // max(1, round(30 * movie.fps)), []).append(start)
-            limit = min(96, len(attempts))
-            diverse = [row[i] for i in range(4) for row in bins.values() if i < len(row)]
-            for start in diverse[:limit]:
-                try:
-                    group = fingerprint_highlight(movie, analysis, start, start + length, cache=cache, role=role,
-                                                  reserved=(*marked, *reserved), min_gap=min_gap, screened=screened)
-                except ValueError:
+        if role == "Highlight" and pause_fractions:
+            position = min(pause_fractions, key=lambda value: abs(value - position))
+        related = [(a, b) for a, b, _ in relevant]
+        counts = Counter()
+        row = {"role": role, "slot": seen[role], "observed_dialogue_cues": len(evidence.captions),
+               "requested_seconds": seconds, "counts": counts}
+        audit.append(row)
+        attempts = []
+        durations = (seconds,) if role != "Highlight" else tuple(dict.fromkeys((seconds, 12, 10, 15)))
+        for duration in durations:
+            length = round(duration * movie.fps)
+            for start in starts:
+                end = start + length
+                if end > analysis.frames:
+                    counts["passage_outside_movie"] += 1
                     continue
-                if joins(group):
-                    marked.append(group)
-                    break
-            else:
-                progress(f"Skipped {role.lower()}: no suitable non-adjacent picture.")
+                first, last = start / movie.fps, end / movie.fps
+                boundaries = sum(any(a < point < b for a, b in evidence.captions) for point in (first, last))
+                left = max(0, int((first + analysis.offset) * 20))
+                right = min(len(evidence.peaks), int((last + analysis.offset) * 20))
+                peaks = evidence.peaks[left:right]
+                if not peaks or max(peaks) < .003:
+                    counts["no_audible_waveform"] += 1
+                    continue
+                sound = evidence.score(float(first + analysis.offset), float(last + analysis.offset))
+                support = any(start <= a < end for a, _, _ in relevant)
+                score = (sound + .20 * by_start[start].score + float(support) - boundaries
+                         - 2 * abs(start / analysis.frames - position) - .04 * abs(duration - seconds))
+                attempts.append((score, start, end))
+        bins = {}
+        for _, start, end in sorted(attempts, reverse=True):
+            buckets = bins.setdefault(start // max(1, round(30 * movie.fps)), [])
+            if len(buckets) < 8:
+                buckets.append((start, end))
+        diverse = [(start, end) for i in range(8) for bucket in bins.values() if i < len(bucket)
+                   for start, end in [bucket[i]]]
+        rows.append((role, related, diverse, row))
+    best = list(marked)
+    branches = 0
+
+    def reserve(index, chosen):
+        nonlocal best, branches
+        if len(chosen) > len(best):
+            best = list(chosen)
+        if index == len(rows):
+            return len(chosen) == len(marked) + len(rows)
+        role, related, candidates, row = rows[index]
+        counts = row["counts"]
+        for start, end in candidates[:96]:
+            if branches >= 256:
+                counts["allocation_search_budget"] += 1
+                break
+            if any(start < c.end and c.start < end for c in chosen if c.movie_audio):
+                counts["reserved_audio"] += 1
+                continue
+            branches += 1
+            counts["passages_tried"] += 1
+            try:
+                group = fingerprint_highlight(movie, analysis, start, end, cache=cache, role=role,
+                    reserved=(*chosen, *reserved), min_gap=min_gap, screened=screened,
+                    rejected=counts, related=related)
+            except ValueError:
+                counts["no_complete_picture_chain"] += 1
+                continue
+            if not joins(group):
+                counts["bookend_join"] += 1
+                continue
+            counts["valid_passages"] += 1
+            if reserve(index + 1, [*chosen, group]):
+                row["selected_source_frames"] = [start, end]
+                return True
+            counts["backtracked"] += 1
+        if len(chosen) + len(rows) - index - 1 > len(best):
+            reserve(index + 1, chosen)
+        return False
+
+    progress("Reserving original-audio picture before narrated footage…")
+    reserve(0, marked)
+    marked = best
     for role, (count, found) in audio_structure(settings, marked).items():
-        detail = "no non-silent candidate passage" if not evidence.peaks or max(evidence.peaks) < .025 else (
-            "no remaining passage with enough screened cutaways and compatible picture joins")
-        omissions.append(f"{role}: found {found} of {count} requested original-audio sections with valid picture; {detail}.")
+        omissions.append(f"{role}: found {found} of {count} requested original-audio sections with valid picture; see audio allocation report.")
     return marked
 
 
@@ -471,14 +514,28 @@ def fit_recording(recording, clips, movie, analysis, cache, min_gap, progress, *
             body = join_removed_cut(body, join_at, movie, analysis, cache)
         join_at = None
         source_frames += clip.frames
-    if source_frames < total:
-        body = grow_picture(body, [*opening, *(group for group, _ in groups), *ending],
-                            total - source_frames, movie, analysis, min_gap, script)
+    original = [*opening, *(group for group, _ in groups), *ending]
+    conflicts = [c for c in body if any(overlaps(c, group) for group in original)]
+    free = [c for c in body if c not in conflicts]
+    while opening and free and adjacent_conflict(opening[-1], free[0], fps, min_gap):
+        conflicts.append(free.pop(0))
+    while ending and free and adjacent_conflict(free[-1], ending[0], fps, min_gap):
+        conflicts.append(free.pop())
+    if any(c.locked for c in conflicts):
+        raise ValueError("Reserved original audio overlaps protected narrated picture.")
+    if conflicts:
+        body = [c for c in body if c not in conflicts]
+        note = f"Reallocated {len(conflicts)} narrated clips to reserve original-audio picture."
+        notices.append(note)
+        progress(note)
+    available = sum(clip.frames for clip in body)
+    if available < total:
+        body = grow_picture(body, original, total - available, movie, analysis, min_gap, script)
         expanded = sum(clip.frames for clip in body)
         if expanded < total:
             raise ValueError(f"Narration needs {float(total / fps):.3f} s of picture. "
                              f"{float(expanded / fps):.3f} s could be placed using the selected picture and eligible cached cuts.")
-        note = f"Added {float((expanded - source_frames) / fps):.1f} s from cached footage to fit narration."
+        note = f"Added {float((expanded - available) / fps):.1f} s from cached footage to fit narration."
         notices.append(note)
         progress(note)
 

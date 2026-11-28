@@ -204,6 +204,8 @@ jobs:
             title="Movie Review Studio V3.4.2 — Original Audio Restoration and Adaptive Export"
           elif [[ "$RELEASE_TAG" == "stage3-windows-v3.4.3" ]]; then
             title="Movie Review Studio V3.4.3 — Mandatory Original Audio"
+          elif [[ "$RELEASE_TAG" == "stage3-windows-v3.4.4" ]]; then
+            title="Movie Review Studio V3.4.4 — Original Audio Allocation and Recovery"
           fi
           gh release create "$RELEASE_TAG" "$ZIP_NAME" \
             --repo "$GITHUB_REPOSITORY" --verify-tag \

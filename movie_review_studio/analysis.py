@@ -196,17 +196,13 @@ def cutaway_without_visible_speaker(media, clip, detector):
                   "-f", "rawvideo", "-threads", "1", "pipe:1", binary=True)
     if len(data) != FRAME_BYTES * len(indices):
         return False
-    previous = None
     for frame in np.frombuffer(data, dtype=np.uint8).reshape((-1, HEIGHT, WIDTH, 3)):
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
         if len(detector.detectMultiScale(gray, 1.1, 4, minSize=(18, 18))):
             return False
-        if previous is not None and np.mean(cv2.absdiff(gray, previous)) > 13:
-            return False
         _, _, black, unusable, text = measure(frame, None)
         if black or unusable or text > .55:
             return False
-        previous = gray
     return True
 
 
@@ -218,69 +214,85 @@ def source_fragment(media, analysis, start, end, cache):
         media, analysis, start, end, cache=cache, candidate=parent)
 
 
-def highlight_picture(media, analysis, start, end, cache, reserved, min_gap, screened=None):
-    fps = media.fps
-    capacity = end - start
-    selected = []
-    # A first matching picture can stay in lip sync. Every subsequent piece must be a local cutaway.
-    anchor = next((c for c in analysis.candidates if not c.production_card and c.shot is not None
-                   and c.start <= start < c.end), None)
-    if anchor is not None:
-        initial = source_fragment(media, analysis, start, min(end, anchor.end), cache)
-        if not any(overlaps(initial, clip) for clip in reserved):
-            selected.append(initial)
-            capacity -= initial.frames
-    if not capacity:
-        return tuple(selected)
-
+def highlight_picture(media, analysis, start, end, cache, reserved, min_gap, screened=None, *,
+                      rejected=None, related=()):
+    from collections import Counter
+    from .model import cut_issue
+    if rejected is None:
+        rejected = Counter()
     if screened is None:
         screened = {}
-    detector = cv2.CascadeClassifier(str(Path(cv2.data.haarcascades) / "haarcascade_frontalface_default.xml"))
+    fps = media.fps
+    needed = end - start
     media = replace(media, offset=analysis.offset)
-    # Prefer local cutaways, then widen to the surrounding sequence while keeping speaker screening.
-    context = round(45 * fps)
-    nearby = [c for c in analysis.candidates if not c.production_card and c.shot is not None
-              and start - context <= c.start <= end + context and (c.end <= start or c.start >= end)
-              and not any(overlaps(c, clip) for clip in reserved)]
-    nearby.sort(key=lambda c: (min(abs(c.start - start), abs(c.start - end)), -c.frames, -c.score))
-    # Try multiple cut chains. A locally attractive shot can prevent a later safe cut.
-    budget = 320
+    anchor = None
+    nearby = []
+    for candidate in analysis.candidates:
+        distance = max(0, start - candidate.end, candidate.start - end)
+        grounded = any(a < candidate.end and candidate.start < b for a, b in related)
+        if candidate.production_card:
+            rejected["production_card"] += 1
+        elif candidate.shot is None:
+            rejected["unknown_shot"] += 1
+        elif any(overlaps(candidate, clip) for clip in reserved):
+            rejected["reserved_picture"] += 1
+        elif candidate.start <= start < candidate.end:
+            anchor = source_fragment(media, analysis, start, min(end, candidate.end), cache)
+        elif candidate.start < end and candidate.end > start:
+            rejected["out_of_sync_passage_picture"] += 1
+        elif distance > 180 * fps and not grounded:
+            rejected["outside_context_without_grounding"] += 1
+        else:
+            nearby.append((distance, grounded, candidate))
+    nearby.sort(key=lambda row: (row[0], not row[1], -row[2].frames, -row[2].score, row[2].start))
+    detector = cv2.CascadeClassifier(str(Path(cv2.data.haarcascades) / "haarcascade_frontalface_default.xml"))
+    for seconds in (45, 90, 180):
+        pool = [c for distance, grounded, c in nearby if distance <= seconds * fps or grounded][:96]
+        budget = 320
 
-    def chain(picture, remaining):
-        nonlocal budget
-        if not remaining:
-            return tuple(picture)
-        for candidate in nearby[:32]:
-            if budget <= 0:
-                break
-            if any(candidate.shot == used.shot for used in picture):
-                continue
-            if picture and adjacent_conflict(picture[-1], candidate, fps, min_gap):
-                continue
-            key = candidate.start, candidate.end
-            if key not in screened:
-                screened[key] = cutaway_without_visible_speaker(media, candidate, detector)
-            if not screened[key]:
-                continue
-            budget -= 1
-            piece = source_fragment(media, analysis, candidate.start, min(candidate.end, candidate.start + remaining), cache)
-            if picture and adjacent_conflict(picture[-1], piece, fps, min_gap):
-                continue
-            result = chain([*picture, piece], remaining - piece.frames)
+        def chain(picture, remaining):
+            nonlocal budget
+            if not remaining:
+                return tuple(picture)
+            for candidate in pool:
+                if budget <= 0:
+                    rejected["picture_search_budget"] += 1
+                    break
+                if any(candidate.shot == used.shot for used in picture):
+                    rejected["reused_source_shot"] += 1
+                    continue
+                piece_end = min(candidate.end, candidate.start + remaining)
+                approximate = replace(candidate, end=piece_end)
+                if picture and (reason := cut_issue(picture[-1], approximate, fps, min_gap)):
+                    rejected[reason] += 1
+                    continue
+                key = candidate.start, candidate.end
+                if key not in screened:
+                    screened[key] = cutaway_without_visible_speaker(media, candidate, detector)
+                if not screened[key]:
+                    rejected["visible_face_or_unusable_cutaway"] += 1
+                    continue
+                budget -= 1
+                piece = source_fragment(media, analysis, candidate.start, piece_end, cache)
+                if picture and (reason := cut_issue(picture[-1], piece, fps, min_gap)):
+                    rejected[reason] += 1
+                    continue
+                result = chain([*picture, piece], remaining - piece.frames)
+                if result:
+                    return result
+            return None
+
+        # A synchronous anchor is useful, but can prevent the only complete strict chain.
+        for prefix in ([anchor], []) if anchor else ([],):
+            result = chain(prefix, needed - sum(c.frames for c in prefix))
             if result:
                 return result
-        return None
-
-    result = chain(selected, capacity)
-    if result:
-        return result
-    raise ValueError("No suitable non-adjacent picture for this original-audio range. Shorten it or choose a different source moment.")
-
+    raise ValueError("No suitable non-adjacent picture for this original-audio range. The allocation report lists the rejected cuts.")
 
 def fingerprint_highlight(media: Media, analysis: Analysis, start: int, end: int, *,
                           cache: Path | None = None, cuts: tuple[int, ...] | None = None,
                           role: str = "", candidate: Clip | None = None, picture=None,
-                          reserved=(), min_gap=5, screened=None) -> Clip:
+                          reserved=(), min_gap=5, screened=None, rejected=None, related=()) -> Clip:
     if candidate:
         if not candidate.start <= start < end <= candidate.end:
             raise ValueError("A fragment must stay inside its analyzed source shot.")
@@ -294,7 +306,8 @@ def fingerprint_highlight(media: Media, analysis: Analysis, start: int, end: int
             legacy_cuts = cuts or highlight_cuts(start, end, media.fps, analysis.shot_starts)
             return replace(clip, cuts=legacy_cuts, legacy_shots=tuple(
                 bisect_right(analysis.shot_starts, point) for point in (start, *legacy_cuts)))
-        fragments = (highlight_picture(media, analysis, start, end, cache, reserved, min_gap, screened) if picture is None
+        fragments = (highlight_picture(media, analysis, start, end, cache, reserved, min_gap, screened,
+                                       rejected=rejected, related=related) if picture is None
                      else tuple(Clip(row[0], row[1], 0, (), (), (), gap=True) if len(row) > 2 and row[2]
                                 else source_fragment(media, analysis, row[0], row[1], cache) for row in picture))
         clip = replace(clip, picture=fragments)
